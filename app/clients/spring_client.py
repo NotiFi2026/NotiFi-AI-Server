@@ -43,8 +43,12 @@ async def record_escalation_step(
     responded_at: Optional[datetime] = None,
     response_detail: Optional[dict[str, Any]] = None,
     guardian_message: Optional[GuardianMessage] = None,
-) -> None:
-    """I2: 에스컬레이션 단계 진행 기록. GUARDIAN_NOTIFY 단계면 guardian_message 포함."""
+) -> dict[str, Any]:
+    """I2: 에스컬레이션 단계 진행 기록. GUARDIAN_NOTIFY 단계면 guardian_message 포함.
+
+    응답 data(기록된 step + escalation_status)를 반환한다 —
+    에이전트가 EMERGENCY_CALL 진행 전 해소 여부를 판단하는 데 쓴다.
+    """
     body: dict[str, Any] = {
         "step_type": step_type,
         "step_order": step_order,
@@ -75,15 +79,18 @@ async def record_escalation_step(
             timeout=10.0,
         )
         resp.raise_for_status()
+    data = resp.json()["data"]
     logger.info(
         "에스컬레이션 단계 기록 완료",
         extra={
             "action": "escalation_step_recorded",
             "escalation_id": escalation_id,
             "step_type": step_type,
-            "status": status,
+            "status": data.get("status", status),
+            "escalation_status": data.get("escalation_status"),
         },
     )
+    return data
 
 
 async def save_daily_report(
