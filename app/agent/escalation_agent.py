@@ -5,6 +5,7 @@ LANGCHAIN_PROJECT=notifi-ai 를 .env에 설정하면 자동 활성화된다.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -18,6 +19,7 @@ from app.agent.response_policy import select_policy
 from app.agent.schemas import EventType, GuardianMessage, NotificationLevel, RiskLevel, VoiceResponseResult, ModelResult
 from app.clients import cartesia_client, spring_client, whisper_client
 from app.common.logging_config import logger
+from app.config import settings
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -298,23 +300,53 @@ async def _submit_guardian_notify_step(state: EscalationState) -> dict:
             "notification_level": state["notification_level"],
         },
     )
+    return {"next_step_order": step_order + 1}
 
-    next_order = step_order + 1
-    if state["escalation_continued"]:
-        await spring_client.record_escalation_step(
-            escalation_id=state["escalation_id"],
-            step_type="EMERGENCY_CALL",
-            step_order=next_order,
-            status="EXECUTED",
-            executed_at=now,
+
+def _route_after_guardian_notify(state: EscalationState) -> str:
+    return "emergency_call" if state["escalation_continued"] else "finish"
+
+
+async def _wait_and_emergency_call(state: EscalationState) -> dict:
+    """보호자 확인 대기 후 EMERGENCY_CALL 진행.
+
+    대기 중 보호자가 앱에서 확인(E3 resolve)하면 Spring이 step을 SKIPPED로
+    강제 기록하므로, 응답의 escalation_status/status로 중단 여부를 확인한다.
+    """
+    delay = settings.emergency_call_delay_seconds
+    logger.info(
+        "긴급 연락 전 보호자 확인 대기",
+        extra={
+            "action": "emergency_call_waiting",
+            "escalation_id": state["escalation_id"],
+            "delay_seconds": delay,
+        },
+    )
+    await asyncio.sleep(delay)
+
+    data = await spring_client.record_escalation_step(
+        escalation_id=state["escalation_id"],
+        step_type="EMERGENCY_CALL",
+        step_order=state["next_step_order"],
+        status="EXECUTED",
+        executed_at=datetime.now(timezone.utc),
+    )
+
+    if data.get("status") == "SKIPPED" or data.get("escalation_status") != "IN_PROGRESS":
+        logger.info(
+            "보호자 확인으로 긴급 연락 중단",
+            extra={
+                "action": "emergency_call_skipped",
+                "escalation_id": state["escalation_id"],
+                "escalation_status": data.get("escalation_status"),
+            },
         )
+    else:
         logger.info(
             "긴급 연락 단계 기록 완료",
             extra={"action": "spring_i2_completed", "step_type": "EMERGENCY_CALL"},
         )
-        next_order += 1
-
-    return {"next_step_order": next_order}
+    return {"next_step_order": state["next_step_order"] + 1}
 
 
 async def _finish(state: EscalationState) -> dict:
@@ -343,6 +375,7 @@ _builder.add_node("classify_voice_response", _classify_voice_response)
 _builder.add_node("record_voice_check_response", _record_voice_check_response)
 _builder.add_node("generate_guardian_message", _generate_guardian_message)
 _builder.add_node("submit_guardian_notify_step", _submit_guardian_notify_step)
+_builder.add_node("wait_and_emergency_call", _wait_and_emergency_call)
 _builder.add_node("finish", _finish)
 
 _builder.set_entry_point("submit_sensing_event")
@@ -369,7 +402,15 @@ _builder.add_conditional_edges(
 )
 _builder.add_edge("record_voice_check_response", "generate_guardian_message")
 _builder.add_edge("generate_guardian_message", "submit_guardian_notify_step")
-_builder.add_edge("submit_guardian_notify_step", "finish")
+_builder.add_conditional_edges(
+    "submit_guardian_notify_step",
+    _route_after_guardian_notify,
+    {
+        "emergency_call": "wait_and_emergency_call",
+        "finish": "finish",
+    },
+)
+_builder.add_edge("wait_and_emergency_call", "finish")
 _builder.add_edge("finish", END)
 
 graph = _builder.compile()

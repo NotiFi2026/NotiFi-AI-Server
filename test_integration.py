@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.agent import escalation_agent
 from app.agent.schemas import EventType, ModelResult, RiskLevel
+from app.config import settings
 
 
 def _model(risk_level: RiskLevel, care_target_id: int = 1) -> ModelResult:
@@ -31,6 +32,8 @@ def _model(risk_level: RiskLevel, care_target_id: int = 1) -> ModelResult:
 
 
 async def main() -> None:
+    settings.emergency_call_delay_seconds = 2  # 통합 테스트에선 대기 단축
+
     # ── DANGER + 음성 무응답 ──────────────────────────────────
     print("=" * 60)
     print("DANGER + 음성 무응답 (실제 Spring 연동)")

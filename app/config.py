@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     spring_base_url: str = "http://localhost:8080"
     spring_internal_key: str = ""
 
+    # GUARDIAN_NOTIFY 후 EMERGENCY_CALL 진행 전 보호자 확인 대기 시간
+    emergency_call_delay_seconds: int = 60
+
     cartesia_api_key: str = ""
     cartesia_voice_id_ko: str = "ce9ca2b6-2bed-4452-99bb-052e1ec0b534"
     cartesia_voice_id_ja: str = "498e7f37-7fa3-4e2c-b8e2-8b6e9276f956"
