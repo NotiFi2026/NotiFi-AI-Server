@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent import escalation_agent
 from app.agent.message_generator import generate_daily_report_summary
+from app.config import settings
 from app.agent.schemas import (
     DailyReportInput,
     DailyReportMetrics,
@@ -34,6 +35,10 @@ def _i1_response(triggered: bool = True, escalation_id: int = 31) -> dict:
         "escalation_triggered": triggered,
         "escalation_id": escalation_id if triggered else None,
     }
+
+
+def _i2_response(status: str = "EXECUTED", escalation_status: str = "IN_PROGRESS") -> dict:
+    return {"status": status, "escalation_status": escalation_status}
 
 
 def _model(
@@ -75,13 +80,15 @@ def _print_i2_calls(mock_record: AsyncMock) -> None:
 
 
 async def main() -> None:
+    settings.emergency_call_delay_seconds = 0  # 테스트에선 대기 생략
+
     # ── 케이스 1: DANGER + 음성 무응답 ──────────────────────
     print("=" * 60)
     print("케이스 1: DANGER + 음성 무응답")
     print("=" * 60)
 
     mock_send = AsyncMock(return_value=_i1_response(triggered=True))
-    mock_record = AsyncMock()
+    mock_record = AsyncMock(return_value=_i2_response())
 
     with patch("app.clients.spring_client.send_sensing_event", mock_send), \
          patch("app.clients.spring_client.record_escalation_step", mock_record), \
@@ -101,7 +108,7 @@ async def main() -> None:
     print("=" * 60)
 
     mock_send2 = AsyncMock(return_value=_i1_response(triggered=True, escalation_id=32))
-    mock_record2 = AsyncMock()
+    mock_record2 = AsyncMock(return_value=_i2_response())
 
     with patch("app.clients.spring_client.send_sensing_event", mock_send2), \
          patch("app.clients.spring_client.record_escalation_step", mock_record2), \
@@ -120,7 +127,7 @@ async def main() -> None:
     print("=" * 60)
 
     mock_send3 = AsyncMock(return_value=_i1_response(triggered=False))
-    mock_record3 = AsyncMock()
+    mock_record3 = AsyncMock(return_value=_i2_response())
 
     with patch("app.clients.spring_client.send_sensing_event", mock_send3), \
          patch("app.clients.spring_client.record_escalation_step", mock_record3):
