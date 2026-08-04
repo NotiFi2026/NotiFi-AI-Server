@@ -71,14 +71,9 @@ class AgentContext(BaseModel):
 
 
 class DailyReportMetrics(BaseModel):
-    activity_level: float = 0.0
-    activity_change_percent: float = 0.0
-    total_inactivity_minutes: int = 0
-    longest_inactive_minutes: int = 0
     warning_event_count: int = 0
     danger_event_count: int = 0
-    respiration_abnormal_count: int = 0
-    avg_breathing_rate: float = 0.0
+    safe_class_counts: dict[str, int] = {}
 
 
 class DailyReportInput(BaseModel):
@@ -87,10 +82,22 @@ class DailyReportInput(BaseModel):
     metrics: DailyReportMetrics
 
 
+class ReportTag(str, Enum):
+    RISK_EVENT = "risk_event"
+
+
+class DailyReportSection(BaseModel):
+    tag: ReportTag
+    risk_level: RiskLevel
+    title: str
+    body: str
+    recommended_action: Optional[str] = None
+
+
 class DailyReportOutput(BaseModel):
     care_target_id: int
     report_date: str
-    summary_text: str
+    sections: list[DailyReportSection]
     metrics: DailyReportMetrics
     generated_at: datetime
 

@@ -96,7 +96,7 @@ async def record_escalation_step(
 async def save_daily_report(
     care_target_id: int,
     report_date: str,
-    summary_text: str,
+    sections: list[dict[str, Any]],
     metrics: dict[str, Any],
 ) -> None:
     """I3: 일일 리포트 적재."""
@@ -106,7 +106,7 @@ async def save_daily_report(
             json={
                 "care_target_id": care_target_id,
                 "report_date": report_date,
-                "summary_text": summary_text,
+                "sections": sections,
                 "metrics": metrics,
             },
             headers=_HEADERS,

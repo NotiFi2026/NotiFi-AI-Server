@@ -146,21 +146,15 @@ async def main() -> None:
         care_target_id=45,
         report_date="2026-07-02",
         metrics=DailyReportMetrics(
-            activity_level=0.55,
-            activity_change_percent=-8.3,
-            total_inactivity_minutes=124,
-            longest_inactive_minutes=47,
             warning_event_count=1,
             danger_event_count=0,
-            respiration_abnormal_count=2,
-            avg_breathing_rate=16.2,
         ),
     )
     output = await generate_daily_report_summary(report_input)
     i3_payload = {
         "care_target_id": output.care_target_id,
         "report_date": output.report_date,
-        "summary_text": output.summary_text,
+        "sections": [s.model_dump() for s in output.sections],
         "metrics": output.metrics.model_dump(),
         "generated_at": output.generated_at.isoformat(),
     }

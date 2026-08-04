@@ -11,14 +11,8 @@ async def main() -> None:
         care_target_id=1,
         report_date="2026-07-02",
         metrics=DailyReportMetrics(
-            activity_level=0.32,
-            activity_change_percent=-18.5,
-            total_inactivity_minutes=210,
-            longest_inactive_minutes=95,
             warning_event_count=2,
             danger_event_count=1,
-            respiration_abnormal_count=0,
-            avg_breathing_rate=16.4,
         ),
     )
 
@@ -30,17 +24,11 @@ async def main() -> None:
     print(json.dumps({
         "care_target_id":  result.care_target_id,
         "report_date":     result.report_date,
-        "summary_text":    result.summary_text,
+        "sections":        [s.model_dump() for s in result.sections],
         "generated_at":    result.generated_at.isoformat(),
         "metrics": {
-            "activity_level":            result.metrics.activity_level,
-            "activity_change_percent":   result.metrics.activity_change_percent,
-            "total_inactivity_minutes":  result.metrics.total_inactivity_minutes,
-            "longest_inactive_minutes":  result.metrics.longest_inactive_minutes,
             "warning_event_count":       result.metrics.warning_event_count,
             "danger_event_count":        result.metrics.danger_event_count,
-            "respiration_abnormal_count":result.metrics.respiration_abnormal_count,
-            "avg_breathing_rate":        result.metrics.avg_breathing_rate,
         },
     }, ensure_ascii=False, indent=2))
 

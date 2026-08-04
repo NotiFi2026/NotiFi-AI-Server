@@ -6,13 +6,16 @@ from typing import Any, Optional
 
 from app.agent.schemas import (
     DailyReportInput,
+    DailyReportMetrics,
     DailyReportOutput,
+    DailyReportSection,
     EventType,
     GuardianMessage,
+    ReportTag,
     RiskLevel,
     VoiceResponseResult,
 )
-from app.clients.llm_client import complete_json, complete_text
+from app.clients.llm_client import complete_json
 from app.common.logging_config import logger
 
 _FORBIDDEN = [
@@ -43,16 +46,22 @@ _SYSTEM_PROMPT_GUARDIAN = """\
 }"""
 
 _SYSTEM_PROMPT_REPORT = """\
-당신은 노인 생활 데이터를 보호자가 이해하기 쉽게 요약하는 리포트 생성기입니다.
+당신은 노인 생활 데이터를 보호자가 이해하기 쉽게 태그별로 요약하는 리포트 생성기입니다.
 
 규칙:
 1. 입력 지표에 없는 내용을 생성하지 않는다.
 2. 질병명, 진단명, 치료 지시를 생성하지 않는다.
-3. 변화가 있는 항목 중심으로 요약한다.
-4. 보호자가 할 수 있는 확인 행동을 제안한다.
-5. "악화", "질환", "치료 필요" 같은 단정 표현을 피한다.
+3. 각 태그의 위험도는 이미 결정되어 입력에 주어진다 — 임의로 바꾸지 않고 그 톤에 맞춰 서술한다.
+4. body는 상황 설명만 한다. 보호자가 할 행동은 body에 넣지 말고 recommended_action에 따로 쓴다.
+5. risk_level이 safe면 recommended_action은 null로 둔다. warning/danger면 recommended_action에 구체적인 확인 행동을 한 문장으로 쓴다.
+6. "악화", "질환", "치료 필요" 같은 단정 표현을 피한다.
+7. 각 섹션의 title은 10자 내외, body는 1~2문장으로 작성한다.
+8. safe_class_counts가 주어지면, 그중 눈에 띄는 활동 1~2개를 골라 실제 횟수를 숫자로 포함해 자연스러운 문장으로 body에 넣는다 (예: "걷기 14회"). absence(부재)는 언급하지 않는다.
 
-하루 생활 패턴 변화를 2~4문장으로 요약한다."""
+응답 형식 (JSON):
+{
+  "risk_event": {"title": "...", "body": "...", "recommended_action": "..." 또는 null}
+}"""
 
 
 def _event_type_label(event_type: EventType) -> str:
@@ -150,19 +159,50 @@ async def generate_guardian_message(
     return message
 
 
-async def generate_daily_report_summary(report_input: DailyReportInput) -> DailyReportOutput:
+def _report_risk_levels(m: DailyReportMetrics) -> dict[ReportTag, RiskLevel]:
+    """지표 임계값으로 태그별 위험도를 결정한다 — LLM이 아니라 코드가 판단한다.
+
+    TODO: 모델 가중치 미반영 상태의 임시 규칙. 정확도 개선된 가중치가 들어오면
+    (팀원 전달 예정 2026-08-09) 모델 출력 기준으로 교체할 것.
+    """
+
+    def _level(danger: bool, warning: bool) -> RiskLevel:
+        if danger:
+            return RiskLevel.DANGER
+        if warning:
+            return RiskLevel.WARNING
+        return RiskLevel.SAFE
+
+    return {
+        ReportTag.RISK_EVENT: _level(
+            m.danger_event_count >= 1, m.warning_event_count >= 1
+        ),
+    }
+
+
+def _build_report_user_prompt(
+    report_input: DailyReportInput, risk_levels: dict[ReportTag, RiskLevel]
+) -> str:
     m = report_input.metrics
-    sign = "+" if m.activity_change_percent >= 0 else ""
-    user_prompt = "\n".join([
+    lines = [
         f"날짜: {report_input.report_date}",
-        f"활동 수준: {m.activity_level:.0%} (전일 대비 {sign}{m.activity_change_percent:.1f}%)",
-        f"평균 호흡 수: 분당 {m.avg_breathing_rate:.1f}회",
-        f"전체 무활동 시간: {m.total_inactivity_minutes}분",
-        f"최장 연속 무활동: {m.longest_inactive_minutes}분",
-        f"주의 이벤트: {m.warning_event_count}건",
-        f"위험 이벤트: {m.danger_event_count}건",
-        f"호흡 이상 이벤트: {m.respiration_abnormal_count}건",
-    ])
+        f"[risk_event] 위험도: {risk_levels[ReportTag.RISK_EVENT].value} | "
+        f"주의 이벤트: {m.warning_event_count}건, 위험 이벤트: {m.danger_event_count}건",
+    ]
+
+    safe_counts = {
+        k: v for k, v in m.safe_class_counts.items() if k != "absence" and v > 0
+    }
+    if safe_counts:
+        counts_str = ", ".join(f"{k} {v}회" for k, v in safe_counts.items())
+        lines.append(f"[risk_event] 오늘의 정상 활동: {counts_str}")
+
+    return "\n".join(lines)
+
+
+async def generate_daily_report_summary(report_input: DailyReportInput) -> DailyReportOutput:
+    risk_levels = _report_risk_levels(report_input.metrics)
+    user_prompt = _build_report_user_prompt(report_input, risk_levels)
 
     logger.info(
         "일일 리포트 생성 시작",
@@ -173,7 +213,17 @@ async def generate_daily_report_summary(report_input: DailyReportInput) -> Daily
         },
     )
 
-    summary_text = await complete_text(_SYSTEM_PROMPT_REPORT, user_prompt)
+    raw = await complete_json(_SYSTEM_PROMPT_REPORT, user_prompt)
+    sections = [
+        DailyReportSection(
+            tag=tag,
+            risk_level=risk_levels[tag],
+            title=raw[tag.value]["title"],
+            body=raw[tag.value]["body"],
+            recommended_action=raw[tag.value].get("recommended_action"),
+        )
+        for tag in ReportTag
+    ]
 
     logger.info(
         "일일 리포트 생성 완료",
@@ -184,7 +234,7 @@ async def generate_daily_report_summary(report_input: DailyReportInput) -> Daily
     return DailyReportOutput(
         care_target_id=report_input.care_target_id,
         report_date=report_input.report_date,
-        summary_text=summary_text,
+        sections=sections,
         metrics=report_input.metrics,
         generated_at=datetime.now(timezone.utc),
     )
