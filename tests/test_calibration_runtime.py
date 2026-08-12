@@ -12,8 +12,9 @@ pytest.importorskip("notifi_ai")
 from notifi_ai.registry import DeviceRegistry  # noqa: E402
 
 from app.model.runtime import ModelRuntime  # noqa: E402
+from tests.conftest import FAKE_SPEC  # noqa: E402
 
-BOARDS = {"rx_id": "RX-1", "tx1_id": "T1", "tx2_id": "T2", "tx3_id": "T3"}
+BOARDS ={"rx_id": "RX-1", "tx1_id": "T1", "tx2_id": "T2", "tx3_id": "T3"}
 
 
 class FakeProfile:
@@ -50,7 +51,7 @@ def make_calibration_npz(trials: int = 2) -> bytes:
 
 @pytest.fixture
 def runtime(tmp_path):
-    return ModelRuntime(FakeModel(), DeviceRegistry(tmp_path))
+    return ModelRuntime(FakeModel(), DeviceRegistry(tmp_path), FAKE_SPEC)
 
 
 def register(runtime, **overrides) -> dict:

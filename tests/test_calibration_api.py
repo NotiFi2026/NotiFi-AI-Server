@@ -3,7 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.model_routes import devices
-from app.api.model_routes.devices import _calibration_warnings
+from app.api.model_routes.devices import calibration_warnings
 from app.config import settings
 from app.model import pipeline
 from main import app
@@ -128,7 +128,7 @@ HEALTHY = {
 
 
 def test_warns_when_fewer_than_two_links_alive():
-    warnings = _calibration_warnings({
+    warnings = calibration_warnings({
         **HEALTHY,
         "baseline_link_valid": [True, False, False],
         "link_coverage": [0.9, 0.0, 0.0],
@@ -137,24 +137,24 @@ def test_warns_when_fewer_than_two_links_alive():
 
 
 def test_no_warnings_when_installation_is_healthy():
-    assert _calibration_warnings(HEALTHY) == []
+    assert calibration_warnings(HEALTHY) == []
 
 
 def test_warns_when_absence_trials_are_insufficient():
     """README에 12회를 계약으로 써놓고 검증하지 않으면 계약이 아니다."""
-    warnings = _calibration_warnings({**HEALTHY, "absence_trials": 3})
+    warnings = calibration_warnings({**HEALTHY, "absence_trials": 3})
     assert any("무인 트라이얼 3회" in w for w in warnings)
 
 
 def test_warns_when_basic_actions_are_missing():
-    warnings = _calibration_warnings({**HEALTHY, "support_action_counts": [0] * 17})
+    warnings = calibration_warnings({**HEALTHY, "support_action_counts": [0] * 17})
     assert any("기본 동작" in w for w in warnings)
 
 
 def test_absence_count_absent_is_not_warned():
     """저장된 프로필 요약에는 트라이얼 수가 없다 — 없다고 경고하면 오탐이다."""
     summary = {k: v for k, v in HEALTHY.items() if k != "absence_trials"}
-    assert _calibration_warnings(summary) == []
+    assert calibration_warnings(summary) == []
 
 
 # ── 삭제 ────────────────────────────────────────────────────────────────────

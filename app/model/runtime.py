@@ -4,6 +4,8 @@ notifi_ai 패키지의 create_app(api.py)이 하던 구성(모델 + 레지스트
 번들 구현이 빠뜨린 두 가지를 여기서 보강한다:
   - 기동 시 warmup 호출 (첫 CUDA 요청이 수십 초 걸리는 것을 없앤다)
   - 블로킹 추론을 이벤트 루프 밖에서 실행 (호출부에서 run_in_threadpool)
+
+모델 패키지 자체는 직접 만지지 않는다 — 전부 `app.model.adapter`를 거친다.
 """
 from __future__ import annotations
 
@@ -15,23 +17,28 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from notifi_ai import NotiFiAIv1
-from notifi_ai.constants import ACTION_TO_RISK, JOINT_NAMES, TARGET_FPS
-from notifi_ai.io import load_calibration_npz, load_query_npz
-from notifi_ai.registry import DeviceRegistry
-from notifi_ai.schemas import DeviceConfig
-
 from app.common.logging_config import logger
 from app.config import Settings, settings
+from app.model.adapter import (
+    DeviceConfig,
+    DeviceRegistry,
+    ModelSpec,
+    build_spec,
+    load_calibration_npz,
+    load_model,
+    load_query_npz,
+)
 from app.model.errors import InferenceBusyError
 
 
 class ModelRuntime:
     """로드된 모델 1개 + 디바이스 레지스트리 + 추론 직렬화 락."""
 
-    def __init__(self, model: NotiFiAIv1, registry: DeviceRegistry) -> None:
+    def __init__(self, model: Any, registry: DeviceRegistry, spec: ModelSpec) -> None:
         self._model = model
         self._registry = registry
+        # 스펙 없이는 결과에 라벨을 못 붙인다 — 선택 인자로 두면 추론 도중에야 터진다
+        self.spec = spec
         # 모델은 스레드 안전하지 않다 — 모든 추론을 직렬화한다
         self._lock = threading.Lock()
         # 진행 상태. 단일 대입/읽기라 GIL 하에서 원자적이고, 관측용이라
@@ -46,18 +53,43 @@ class ModelRuntime:
         파라미터명이 `settings`면 모듈 전역 settings를 섀도잉해, 같은 클래스가
         설정을 두 경로로 받는 것처럼 보인다.
         """
-        model = NotiFiAIv1(
+        model = load_model(
             artifact_dir=config.notifi_artifact_dir,
             device=config.notifi_model_device,
+            class_name=config.notifi_model_class,
         )
+        # 계약 검증이 warmup보다 먼저다 — 매핑이 어긋난 모델로 워밍업까지 하고 나서
+        # 실패하면 수십 초를 버린다
+        spec = build_spec(model)
         model.warmup()
-        return cls(model, DeviceRegistry(config.notifi_registry_root))
+        return cls(model, DeviceRegistry(config.notifi_registry_root), spec)
 
     def describe(self) -> dict[str, Any]:
         return self._model.describe()
 
     def list_devices(self) -> list[str]:
         return self._registry.list_devices()
+
+    def list_device_configs(self) -> list[Any]:
+        """등록된 디바이스 설정 전체. 수집 데몬이 보드 MAC → 링크 매핑을 만드는 데 쓴다.
+
+        레지스트리에 파일만 있고 읽을 수 없는 항목은 건너뛴다 — 한 가구의 손상된 파일이
+        나머지 가구의 수집까지 막으면 안 된다.
+        """
+        configs = []
+        for device_id in self._registry.list_devices():
+            try:
+                configs.append(self._registry.load_device(device_id))
+            except Exception as exc:  # noqa: BLE001 - 손상 파일 하나로 전체가 죽지 않게
+                logger.warning(
+                    "디바이스 설정 로드 실패 — 건너뜀",
+                    extra={
+                        "action": "device_config_unreadable",
+                        "device_id": device_id,
+                        "error": str(exc),
+                    },
+                )
+        return configs
 
     def inflight_seconds(self) -> float | None:
         """진행 중인 추론의 경과 시간. 유휴면 None.
@@ -171,8 +203,21 @@ class ModelRuntime:
         추론보다 훨씬 오래 걸리므로 전용 락 타임아웃을 쓴다 — 추론 대기(3초)로는
         자기 차례를 못 잡는다.
         """
-        self._registry.load_device(device_id)  # 등록 선행 확인
         absence, support = load_calibration_npz(payload)
+        return self.fit_calibration_arrays(device_id, absence, support)
+
+    def fit_calibration_arrays(
+        self,
+        device_id: str,
+        absence: list[Any],
+        support: list[Any],
+    ) -> dict[str, Any]:
+        """이미 배열로 들고 있는 트라이얼로 프로필을 학습·저장한다.
+
+        수집 데몬은 라이브 버퍼에서 바로 윈도를 뜨므로 NPZ 왕복이 필요 없다.
+        NPZ 경로도 여기로 들어와 **락·저장·요약이 한 곳에서만 일어난다.**
+        """
+        self._registry.load_device(device_id)  # 등록 선행 확인
 
         # 학습과 저장을 한 임계구역에 둔다 — 동시 캘리브레이션 시 fit 결과와
         # 디스크 내용이 어긋나는 것을 막는다.
@@ -239,8 +284,22 @@ class ModelRuntime:
 
         무보정 추론은 허용하지 않는다 — 확정된 연동 계약.
         """
-        profile = self._registry.load_calibration(device_id)
         csi, link_mask = load_query_npz(payload)
+        return self.predict_arrays(device_id, csi, link_mask, include_pose)
+
+    def predict_arrays(
+        self,
+        device_id: str,
+        csi: Any,
+        link_mask: Any,
+        include_pose: bool = False,
+    ) -> dict[str, Any]:
+        """이미 배열로 들고 있는 윈도를 추론한다.
+
+        수집 데몬은 버퍼에서 바로 배열을 만들므로 NPZ로 직렬화했다가 다시 푸는 왕복이 불필요하다.
+        NPZ 경로(predict_npz)도 결국 여기로 들어와 **락·로깅·라벨링이 한 곳에서만 일어난다.**
+        """
+        profile = self._registry.load_calibration(device_id)
 
         with self._exclusive(settings.notifi_inference_lock_timeout_seconds, device_id):
             prediction = self._model.predict(csi, link_mask, profile)
@@ -255,12 +314,21 @@ class ModelRuntime:
                 "low_quality": prediction.quality.get("low_quality"),
             },
         )
-        result = prediction.to_dict(include_pose=include_pose)
-        # 변환 계층이 notifi_ai에 의존하지 않도록 필요한 상수를 여기서 실어 보낸다.
-        # action_risk_id는 행동의 정적 카테고리(0 safe/1 warning/2 danger)로,
-        # 독립 위험도 헤드(risk_label)와 다르다 — event_type 매핑에 쓴다.
-        result["action_risk_id"] = ACTION_TO_RISK[prediction.action_id]
+        return self._decorate(prediction.to_dict(include_pose=include_pose),
+                             prediction.action_id, include_pose)
+
+    def _decorate(self, result: dict[str, Any], action_id: int, include_pose: bool) -> dict[str, Any]:
+        """변환 계층이 notifi_ai를 모르도록, 계약값을 결과 dict에 실어 보낸다.
+
+        action_risk_id는 행동의 정적 카테고리(0 safe/1 warning/2 danger)로,
+        독립 위험도 헤드(risk_label)와 다르다 — event_type 매핑에 쓴다.
+        """
+        spec = self.spec
+        result["action_risk_id"] = spec.action_to_risk[action_id]
         if include_pose:
-            result["joints"] = list(JOINT_NAMES)
-            result["fps"] = TARGET_FPS
+            result["joints"] = list(spec.joint_names)
+            result["fps"] = spec.fps
+            # 스키마를 여기서 붙여야 모델이 바뀌면 저장되는 라벨도 같이 바뀐다.
+            # 파이프라인에 상수로 박아두면 v2에서 거짓 라벨이 적재된다.
+            result["joint_schema"] = spec.joint_schema
         return result
