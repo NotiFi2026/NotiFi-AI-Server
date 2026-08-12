@@ -1,4 +1,8 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
@@ -16,6 +20,14 @@ class Settings(BaseSettings):
     cartesia_api_key: str = ""
     cartesia_voice_id_ko: str = "ce9ca2b6-2bed-4452-99bb-052e1ec0b534"
     cartesia_voice_id_ja: str = "498e7f37-7fa3-4e2c-b8e2-8b6e9276f956"
+
+    # notifi-ai 모델 런타임. False면 로드를 건너뛴다(에이전트만 개발할 때 CUDA 초기화 회피)
+    notifi_model_enabled: bool = True
+    # None이면 cuda 우선 자동 선택. artifact_dir도 None이면 패키지 기본 경로
+    notifi_model_device: str | None = None
+    notifi_artifact_dir: str | None = None
+    # 패키지 기본값 "runtime/devices"는 cwd 의존이라 절대 경로로 고정한다
+    notifi_registry_root: str = str(_REPO_ROOT / "runtime" / "devices")
 
 
 settings = Settings()
