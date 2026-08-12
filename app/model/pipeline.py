@@ -29,6 +29,25 @@ def round_probability(value: float | None) -> float | None:
     return None if value is None else round(float(value), PROBABILITY_DIGITS)
 
 
+# ── device_id ↔ care_target_id ──────────────────────────────────────────────
+# 모델 레지스트리의 device_id는 "가구 1채"(RX1+TX3 보드 4개) 단위라 Spring의
+# care_target과 1:1이다. 별도 매핑 테이블 대신 규약으로 파생한다.
+
+_DEVICE_ID_PREFIX = "care-"
+
+
+def device_id_for(care_target_id: int) -> str:
+    return f"{_DEVICE_ID_PREFIX}{care_target_id}"
+
+
+def care_target_id_from(device_id: str) -> int | None:
+    """규약을 따르는 device_id면 노인 ID를, 아니면 None(수동 등록된 레거시 등)."""
+    if not device_id.startswith(_DEVICE_ID_PREFIX):
+        return None
+    suffix = device_id[len(_DEVICE_ID_PREFIX):]
+    return int(suffix) if suffix.isdigit() else None
+
+
 def to_model_result(
     pred: dict[str, Any],
     care_target_id: int,

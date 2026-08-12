@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from notifi_ai import NotiFiAIv1
 from notifi_ai.constants import ACTION_TO_RISK, JOINT_NAMES, TARGET_FPS
-from notifi_ai.io import load_query_npz
+from notifi_ai.io import load_calibration_npz, load_query_npz
 from notifi_ai.registry import DeviceRegistry
+from notifi_ai.schemas import DeviceConfig
 
 from app.common.logging_config import logger
 from app.config import Settings, settings
@@ -68,6 +70,84 @@ class ModelRuntime:
         finished = self._last_success_at
         return None if finished is None else time.monotonic() - finished
 
+    @contextmanager
+    def _exclusive(self, timeout: float, device_id: str) -> Iterator[None]:
+        """모델 접근을 직렬화한다. 추론과 캘리브레이션이 같은 규칙을 쓰도록 한 곳에 둔다.
+
+        무한 대기하면 스레드풀이 채워지며 서버 전체가 조용히 멎는다.
+        포기하고 503을 주면 호출자가 해당 윈도를 버리고 다음 윈도로 넘어간다.
+        """
+        if not self._lock.acquire(timeout=timeout):
+            logger.warning(
+                "모델 락 획득 실패 — 앞 작업이 지연/정지 중",
+                extra={
+                    "action": "inference_busy",
+                    "device_id": device_id,
+                    "inflight_seconds": self.inflight_seconds(),
+                },
+            )
+            raise InferenceBusyError(f"model busy (waited {timeout}s)")
+        try:
+            self._inflight_since = time.monotonic()
+            yield
+            self._last_success_at = time.monotonic()
+        finally:
+            self._inflight_since = None
+            self._lock.release()
+
+    def register_device(self, config: dict[str, Any]) -> str:
+        """디바이스를 레지스트리에 등록한다. 저장 경로는 반환하지 않는다(내부 경로 비노출)."""
+        device_config = DeviceConfig(**config)
+        self._registry.register(device_config)
+        logger.info(
+            "디바이스 등록",
+            extra={"action": "device_registered", "device_id": device_config.device_id},
+        )
+        return device_config.device_id
+
+    def fit_calibration_npz(self, device_id: str, payload: bytes) -> dict[str, Any]:
+        """캘리브레이션 NPZ로 프로필을 학습·저장하고 요약을 반환한다.
+
+        등록되지 않은 디바이스면 FileNotFoundError. 추론보다 훨씬 오래 걸리므로
+        전용 락 타임아웃을 쓴다 — 추론 대기(3초)로는 자기 차례를 못 잡는다.
+        """
+        self._registry.load_device(device_id)  # 등록 선행 확인
+        absence, support = load_calibration_npz(payload)
+
+        with self._exclusive(settings.notifi_calibration_lock_timeout_seconds, device_id):
+            profile = self._model.fit_calibration(device_id, absence, support)
+        self._registry.save_calibration(profile)
+
+        summary = profile.summary()
+        logger.info(
+            "캘리브레이션 완료",
+            extra={
+                "action": "calibration_fitted",
+                "device_id": device_id,
+                "absence_trials": len(absence),
+                "support_trials": len(support),
+                "link_coverage": summary.get("link_coverage"),
+            },
+        )
+        return summary
+
+    def device_status(self, device_id: str) -> dict[str, Any]:
+        """등록·캘리브레이션 여부. 위저드가 어디까지 진행됐는지 판단하는 근거."""
+        try:
+            self._registry.load_device(device_id)
+        except FileNotFoundError:
+            return {"device_id": device_id, "registered": False, "calibrated": False}
+        try:
+            profile = self._registry.load_calibration(device_id)
+        except FileNotFoundError:
+            return {"device_id": device_id, "registered": True, "calibrated": False}
+        return {
+            "device_id": device_id,
+            "registered": True,
+            "calibrated": True,
+            "calibration": profile.summary(),
+        }
+
     def predict_npz(
         self,
         device_id: str,
@@ -81,26 +161,8 @@ class ModelRuntime:
         profile = self._registry.load_calibration(device_id)
         csi, link_mask = load_query_npz(payload)
 
-        timeout = settings.notifi_inference_lock_timeout_seconds
-        if not self._lock.acquire(timeout=timeout):
-            # 무한 대기하면 스레드풀이 채워지며 서버 전체가 조용히 멎는다.
-            # 포기하고 503을 주면 호출자가 해당 윈도를 버리고 다음 윈도로 넘어간다.
-            logger.warning(
-                "추론 락 획득 실패 — 앞 추론이 지연/정지 중",
-                extra={
-                    "action": "inference_busy",
-                    "device_id": device_id,
-                    "inflight_seconds": self.inflight_seconds(),
-                },
-            )
-            raise InferenceBusyError(f"inference busy (waited {timeout}s)")
-        try:
-            self._inflight_since = time.monotonic()
+        with self._exclusive(settings.notifi_inference_lock_timeout_seconds, device_id):
             prediction = self._model.predict(csi, link_mask, profile)
-            self._last_success_at = time.monotonic()
-        finally:
-            self._inflight_since = None
-            self._lock.release()
 
         logger.info(
             "모델 추론 완료",
