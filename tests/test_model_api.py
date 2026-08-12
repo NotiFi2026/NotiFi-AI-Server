@@ -80,6 +80,50 @@ def test_predict_503_when_runtime_missing(client):
     assert res.status_code == 503
 
 
+class StuckRuntime:
+    """추론이 멈춘 런타임 흉내 — 모델 없이 health 판정만 검증한다."""
+
+    def __init__(self, inflight: float) -> None:
+        self._inflight = inflight
+
+    def inflight_seconds(self):
+        return self._inflight
+
+    def last_success_age_seconds(self):
+        return None
+
+    def describe(self):
+        raise AssertionError("멈춤이면 describe까지 가지 않아야 한다")
+
+
+def test_health_503_when_inference_stuck(client, monkeypatch):
+    """멈춘 CUDA 연산은 되돌릴 수 없다 — 재시작을 유도할 유일한 신호가 이 503이다."""
+    monkeypatch.setattr(settings, "notifi_inference_stuck_seconds", 60.0)
+    client.app.state.model_runtime = StuckRuntime(inflight=120.0)
+    try:
+        assert client.get("/internal/model/health").status_code == 503
+    finally:
+        client.app.state.model_runtime = None
+
+
+def test_health_ok_while_inference_is_merely_running(client, monkeypatch):
+    """진행 중이라고 아프다고 하면 안 된다 — 한도를 넘겨야 멈춤이다."""
+    monkeypatch.setattr(settings, "notifi_inference_stuck_seconds", 60.0)
+
+    class Running(StuckRuntime):
+        def describe(self):
+            return {
+                "model_name": "NotiFi_AI_v1", "device": "cpu",
+                "actions": [], "risks": [], "artifact_dir": "/x", "metadata": {},
+            }
+
+    client.app.state.model_runtime = Running(inflight=1.0)
+    try:
+        assert client.get("/internal/model/health").status_code == 200
+    finally:
+        client.app.state.model_runtime = None
+
+
 def test_ingest_rejects_wrong_key(client):
     res = client.post(
         "/internal/model/devices/home-001/ingest",
