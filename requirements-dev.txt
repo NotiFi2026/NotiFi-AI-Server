@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0
+# TestClient용 — fastapi가 의존하는 starlette의 테스트 유틸이 httpx를 쓴다
+httpx>=0.27.0

@@ -9,3 +9,10 @@ langgraph>=0.3.0
 langsmith>=0.2.0
 sounddevice>=0.4.6
 numpy>=1.24.0
+python-multipart>=0.0.9
+
+# --- 모델 런타임 (pip install -r 로는 안 깔린다. Python 3.11 venv에서 아래 2줄을 직접 실행) ---
+# torch는 CUDA 휠이 PyPI에 없어 전용 인덱스가 필요하다. Python 3.14에는 휠 자체가 없다.
+#   pip install torch==2.13.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+# notifi-ai는 형제 레포에 있고 artifacts(~109MB)가 package-data가 아니라 editable로 설치한다.
+#   pip install -e ../NotiFi-CSI-to-Pose/NotiFi_AI_v1
