@@ -1,5 +1,8 @@
 .env
 .venv/
+.venv.*/
 __pycache__/
 *.pyc
 *.html
+# 디바이스 등록·캘리브레이션 프로필 (서버 로컬 상태)
+runtime/
