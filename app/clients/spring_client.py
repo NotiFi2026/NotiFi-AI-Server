@@ -1,4 +1,4 @@
-"""Spring 백엔드 내부 API 클라이언트 (I1·I2·I3)."""
+"""Spring 백엔드 내부 API 클라이언트 (I1·I2·I3·I5)."""
 from datetime import datetime
 from typing import Any, Optional
 

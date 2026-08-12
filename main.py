@@ -22,9 +22,15 @@ async def lifespan(app: FastAPI):
             from app.model.runtime import ModelRuntime
 
             app.state.model_runtime = ModelRuntime.load(settings)
+            described = app.state.model_runtime.describe()
+            # describe() 전체를 실으면 성능지표·절대경로까지 담긴 거대한 한 줄이 된다
             logger.info(
                 "모델 로드 완료",
-                extra={"action": "model_loaded", **app.state.model_runtime.describe()},
+                extra={
+                    "action": "model_loaded",
+                    "model_name": described["model_name"],
+                    "device": described["device"],
+                },
             )
         except Exception as exc:
             logger.error(

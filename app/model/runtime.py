@@ -35,14 +35,18 @@ class ModelRuntime:
         self._last_success_at: float | None = None
 
     @classmethod
-    def load(cls, settings: Settings) -> "ModelRuntime":
-        """아티팩트를 로드하고 warmup까지 마친 런타임을 반환한다."""
+    def load(cls, config: Settings) -> "ModelRuntime":
+        """아티팩트를 로드하고 warmup까지 마친 런타임을 반환한다.
+
+        파라미터명이 `settings`면 모듈 전역 settings를 섀도잉해, 같은 클래스가
+        설정을 두 경로로 받는 것처럼 보인다.
+        """
         model = NotiFiAIv1(
-            artifact_dir=settings.notifi_artifact_dir,
-            device=settings.notifi_model_device,
+            artifact_dir=config.notifi_artifact_dir,
+            device=config.notifi_model_device,
         )
         model.warmup()
-        return cls(model, DeviceRegistry(settings.notifi_registry_root))
+        return cls(model, DeviceRegistry(config.notifi_registry_root))
 
     def describe(self) -> dict[str, Any]:
         return self._model.describe()
