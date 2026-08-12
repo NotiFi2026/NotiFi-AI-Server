@@ -41,12 +41,38 @@ py -3.11 -m venv .venv
 |---|---|---|---|
 | POST | `/internal/agent/run` | `X-Internal-Key` | `ModelResult` 수신 → 백그라운드로 에스컬레이션 실행, 202 |
 | GET | `/internal/model/health` | 선택 | 모델 로드 상태(17행동·3위험도). 키를 주면 설치 경로·성능지표·등록 디바이스까지 |
+| POST | `/internal/model/devices` | `X-Internal-Key` | 설치 1채 등록. `device_id`는 서버가 `care-{care_target_id}`로 만든다, 201 |
+| GET | `/internal/model/devices/{device_id}` | `X-Internal-Key` | 등록·캘리브레이션 진행 상태 |
+| POST | `/internal/model/devices/{device_id}/calibrate` | `X-Internal-Key` | 캘리브레이션 NPZ로 프로필 학습 |
+| DELETE | `/internal/model/devices/{device_id}` | `X-Internal-Key` | 등록·프로필 제거(재설치·철거) |
 | POST | `/internal/model/devices/{device_id}/predict` | `X-Internal-Key` | 쿼리 NPZ 추론만 하고 결과를 돌려준다(순수 프로브). `?include_pose=true`면 SMPL-22 좌표 포함 |
 | POST | `/internal/model/devices/{device_id}/ingest` | `X-Internal-Key` | **추론 → Spring 적재 → 에스컬레이션** 전체 파이프라인, 202 |
 | GET | `/status` | 없음 | 앱 폴링용 현재 위험도 (데모) |
 | POST | `/status/demo` | 없음 | 위험도 수동 변경 (데모 전용) |
 
 쿼리 NPZ는 `csi [T≤304, 3, 114, 2] float32` + `link_mask [T, 3] bool`. 30Hz 기준 304프레임 ≈ 10.13초 윈도다. 업로드 상한 8MB, `device_id`는 `[A-Za-z0-9_-]{1,64}`만 허용한다(레지스트리 경로 세그먼트로 쓰이므로).
+
+### 캘리브레이션 (설치 시 1회)
+
+추론은 캘리브레이션 프로필 없이는 400이다. 설치 순서는 **등록 → 캘리브레이션 → 추론**이다.
+
+```
+POST /internal/model/devices                     {care_target_id, rx_id, tx1_id, tx2_id, tx3_id}
+POST /internal/model/devices/care-1/calibrate    calibration.npz
+GET  /internal/model/devices/care-1              → {registered, calibrated, usable, warnings}
+```
+
+- **`device_id` = `care-{care_target_id}`** — 모델의 캘리브레이션 단위가 "가구 1채"라 Spring의 노인과 1:1이다. 별도 매핑 테이블 대신 규약으로 파생하며, `ingest`는 경로의 `device_id`와 `care_target_id`가 어긋나면 **400**으로 막는다(응급 이벤트가 엉뚱한 노인에게 적재되는 것 방지).
+- **보드는 4개**다: RX 1 + TX 3. 방향은 `RX=North / TX1=South / TX2=West / TX3=East`로 모델이 **고정 계약**으로 강제하므로 앱이 선택지로 노출하면 안 된다.
+- **수집 계약**(모델 문서 §3.4): 무인 상태 **10초 × 12회**, 기본 8동작(걷기·서기·앉기·눕기·누웠다 일어서기·정상적으로 눕기·앉았다 일어서기·서 있다 앉기) **각 2회**. 낙상 5종은 선택이며 매트·보조 인력을 갖춘 통제 환경에서만. 트라이얼은 **30Hz × 304프레임 ≈ 10.13초**가 상한이라 더 길면 뒤가 잘린다.
+- NPZ 키: `absence_csi [N,304,3,114,2] f32` + `absence_mask [N,304,3] bool`, 선택으로 `support_csi/support_mask/support_action/support_risk`. **트라이얼 1건 ≈ 0.79MiB, 12+16건이면 ~21MiB**라 추론(8MiB)과 다른 상한(`NOTIFI_CALIBRATION_MAX_UPLOAD_MB`, 기본 64)을 쓴다.
+- 응답의 **`usable`·`warnings`**로 설치 품질과 수집 규모를 알린다(유효 링크 2개 미만, 커버리지 0.35 미만, 무인 12회 미만, 기본 8동작 각 2회 미만). 거부하지 않고 알리는 이유는 재시도로 덮어쓸 수 있고, 응급 시스템에서 "왜 안 되는지 모르는 실패"가 더 나쁘기 때문이다.
+- **보드 구성이 바뀐 재등록은 기존 프로필을 폐기한다.** 보드 4종 ID 중 하나라도 달라지면 `calibration.pt`를 지우고 응답에 `calibration_invalidated: true`를 준다 — 이전 하드웨어용 baseline으로 추론을 계속하면 낙상 판정이 조용히 틀어진다(모델 문서 §3.5). 재캘리브레이션 전까지 추론은 400이다. 같은 구성 재등록(오타 수정·펌웨어 갱신)은 프로필을 유지한다.
+- 프로필 저장은 **임시 파일 → `os.replace`** 로 교체한다. 대상 경로에 바로 쓰면 저장 중 중단 시 프로필이 깨지고 그 가구는 재캘리브레이션 전까지 모든 추론이 400이 된다.
+- 캘리브레이션은 **동시 1건**이다(초과 시 503). 업로드·압축해제만으로 요청당 수십 MB를 쓰는데 이 구간은 모델 락 밖이라, 막지 않으면 동시 요청이 메모리를 밀어낸다. 업로드는 메모리에 통째로 올리지 않고 디스크로 스풀한다.
+- 캘리브레이션은 추론과 **같은 모델 락**을 쓰지만 대기 한도가 다르다(`NOTIFI_CALIBRATION_LOCK_TIMEOUT_SECONDS`, 기본 120초). 추론의 3초를 그대로 쓰면 추론이 계속 들어오는 동안 캘리브레이션이 자기 차례를 못 잡는다. 실측상 락 점유 자체는 1초 미만이고, 21MiB 업로드·압축해제가 시간의 대부분(총 ~26초)을 차지하며 이는 **락 밖**에서 일어난다.
+
+> 아직 ESP 실시간 데몬이 없어 **라이브 수집 경로는 없다.** 현재는 이미 만들어진 NPZ를 업로드하는 방식이며, 앱 위저드와 연결 확인 엔드포인트는 데몬이 나온 뒤 붙인다.
 
 ### ingest 파이프라인
 

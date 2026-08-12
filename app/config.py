@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     notifi_inference_lock_timeout_seconds: float = 3.0
     # 한 추론이 이보다 오래 진행 중이면 멈춘 것으로 보고 health가 503을 반환한다
     notifi_inference_stuck_seconds: float = 60.0
+    # 캘리브레이션 NPZ는 트라이얼당 ~0.79MiB — absence 12 + support 16이면 ~22MiB
+    notifi_calibration_max_upload_mb: int = 64
+    # 캘리브레이션은 support 트라이얼마다 forward를 돌려 수 초가 걸린다.
+    # 추론 대기(3초)와 같은 값을 쓰면 캘리브레이션이 자기 차례를 못 잡는다.
+    notifi_calibration_lock_timeout_seconds: float = 120.0
 
 
 settings = Settings()

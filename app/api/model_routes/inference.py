@@ -1,85 +1,35 @@
-"""모델 추론 엔드포인트 — 캘리브레이션된 디바이스의 CSI 윈도를 판정한다."""
+"""추론 — 상태 조회, 순수 추론 프로브, Spring 적재 파이프라인.
+
+predict는 판정 결과를 호출자에게 돌려주기만 한다(디버깅·검증용).
+ingest는 그 결과를 Spring 적재·에스컬레이션까지 이어붙인 운영 경로다.
+"""
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+)
 
 from app.agent import escalation_agent
 from app.agent.payload_builder import build_sensing_event_payload
 from app.agent.schemas import EventType, RiskLevel
-from app.api.auth import check_internal_key
+from app.api.model_routes._common import get_runtime, guard_inference, run_inference
 from app.api.routes import run_agent_safely
 from app.clients import spring_client
 from app.common.logging_config import logger
 from app.config import settings
 from app.model import pipeline
-from app.model.errors import InferenceBusyError, ModelContractError
+from app.model.errors import ModelContractError
 
-if TYPE_CHECKING:
-    # 런타임에 import하면 torch·notifi_ai가 기동 시 무조건 로드된다.
-    # 모델 미설치 환경에서도 서버는 떠야 하므로 타입 검사에서만 참조한다.
-    from app.model.runtime import ModelRuntime
-
-router = APIRouter(prefix="/internal/model")
-
-# 레지스트리 경로를 만들기 전에 막는다 — device_id는 경로 세그먼트로 쓰인다
-_DEVICE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-# 쿼리 NPZ는 304프레임 기준 ~1MB. 여유를 두되 무제한 적재는 막는다
-_MAX_UPLOAD_BYTES = 8 * 1024 * 1024
-
-
-def _runtime(request: Request) -> "ModelRuntime":
-    runtime = getattr(request.app.state, "model_runtime", None)
-    if runtime is None:
-        raise HTTPException(status_code=503, detail="Model runtime is not loaded")
-    return runtime
-
-
-def _guard(x_internal_key: str, device_id: str, file: bytes) -> None:
-    """두 추론 엔드포인트가 공유하는 입력 가드 — 한쪽만 고치는 사고를 막는다."""
-    check_internal_key(x_internal_key)
-    if not _DEVICE_ID.match(device_id):
-        raise HTTPException(status_code=400, detail="Invalid device_id")
-    if len(file) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Upload too large")
-
-
-async def _infer(
-    runtime: "ModelRuntime",
-    device_id: str,
-    file: bytes,
-    include_pose: bool,
-    action: str,
-) -> dict[str, Any]:
-    """추론 실행 + 실패 분류. 응답 본문에는 내부 경로를 담지 않는다."""
-    try:
-        return await run_in_threadpool(runtime.predict_npz, device_id, file, include_pose)
-    except InferenceBusyError as exc:
-        # 502(Spring 장애)와 구분한다 — 이건 이 서버가 바쁜 것이고, 호출자는 윈도를 버리면 된다
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (FileNotFoundError, KeyError, ValueError) as exc:
-        # 입력 계열만 400. 예외 메시지에는 calibration.pt 절대경로가 들어 있어 로그로만 남긴다
-        logger.warning(
-            "추론 입력 오류",
-            extra={"action": f"{action}_rejected", "device_id": device_id, "error": str(exc)},
-        )
-        raise HTTPException(
-            status_code=400, detail="Invalid query NPZ or missing calibration profile"
-        ) from exc
-    except Exception as exc:
-        # ModelContractError·CUDA 오류 등 서버 문제는 500 (400으로 내리면 호출자가 재시도하지 않는다)
-        logger.error(
-            "추론 실패",
-            extra={"action": f"{action}_failed", "device_id": device_id, "error": str(exc)},
-            exc_info=True,
-        )
-        raise HTTPException(status_code=500, detail="Inference failed") from exc
+router = APIRouter()
 
 
 @router.get("/health")
@@ -137,8 +87,10 @@ async def predict(
 
     캘리브레이션 프로필이 없는 디바이스는 400 — 무보정 추론은 허용하지 않는다.
     """
-    _guard(x_internal_key, device_id, file)
-    return await _infer(_runtime(request), device_id, file, include_pose, "model_predict")
+    guard_inference(x_internal_key, device_id, file)
+    return await run_inference(
+        get_runtime(request), device_id, file, include_pose, "model_predict"
+    )
 
 
 @router.post("/devices/{device_id}/ingest", status_code=202)
@@ -157,7 +109,14 @@ async def ingest(
     care_target_id는 호출자가 준다 — 모델 레지스트리의 device_id와 Spring의 노인 ID를
     잇는 수단이 아직 없다. window_end_at도 모델이 시각을 모르므로 호출자가 준다(기본 now).
     """
-    _guard(x_internal_key, device_id, file)
+    guard_inference(x_internal_key, device_id, file)
+    derived = pipeline.care_target_id_from(device_id)
+    if derived is not None and derived != care_target_id:
+        # device_id=care-5인데 care_target_id=7이면 응급 이벤트가 엉뚱한 노인에게 적재된다
+        raise HTTPException(
+            status_code=400,
+            detail=f"device_id targets care_target {derived}, not {care_target_id}",
+        )
     if window_end_at is not None and window_end_at.tzinfo is None:
         # naive 시각을 받아들이면 로컬시간으로 해석돼 detected_at이 조용히 어긋난다.
         # detected_at은 멱등키의 일부라 중복 판정까지 깨지므로 거부한다.
@@ -167,7 +126,9 @@ async def ingest(
 
     # 항상 포즈까지 받는다 — 추론 전에는 비정상 여부를 알 수 없고,
     # 배열 직렬화는 수 ms로 추론 210ms 대비 무시할 수준이다.
-    pred = await _infer(_runtime(request), device_id, file, True, "model_ingest")
+    pred = await run_inference(
+        get_runtime(request), device_id, file, True, "model_ingest"
+    )
 
     detected_at = window_end_at or datetime.now(timezone.utc)
     try:

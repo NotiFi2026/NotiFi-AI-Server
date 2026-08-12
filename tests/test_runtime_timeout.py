@@ -49,9 +49,27 @@ class FakeModel:
         return FakePrediction()
 
 
+class FakeProfile:
+    def __init__(self, device_id: str = "care-1") -> None:
+        self.device_id = device_id
+
+    def save(self, path):
+        path.write_bytes(b"profile")
+        return path
+
+    def summary(self) -> dict:
+        return {"baseline_link_valid": [True, True, True], "link_coverage": [0.9, 0.9, 0.9]}
+
+
 class FakeRegistry:
+    def __init__(self, root="."):
+        self.root = root
+
     def load_calibration(self, device_id: str):
         return None
+
+    def load_device(self, device_id: str):
+        return {"device_id": device_id}
 
 
 @pytest.fixture
@@ -99,6 +117,55 @@ def test_lock_released_and_state_cleared_after_success(npz):
     assert runtime.last_success_age_seconds() is not None
     # 락이 풀렸으므로 다음 추론이 곧바로 된다
     runtime.predict_npz("home-001", npz)
+
+
+def make_calibration_npz() -> bytes:
+    """load_calibration_npz가 읽는 최소 NPZ — absence만 있으면 support는 선택이다."""
+    buffer = io.BytesIO()
+    np.savez_compressed(
+        buffer,
+        absence_csi=np.zeros((2, 8, 3, 114, 2), np.float32),
+        absence_mask=np.ones((2, 8, 3), bool),
+    )
+    return buffer.getvalue()
+
+
+def test_calibration_uses_its_own_lock_timeout(monkeypatch, tmp_path):
+    """캘리브레이션은 추론(3초)보다 오래 걸린다 — 같은 타임아웃을 쓰면 자기 차례를 못 잡는다."""
+    monkeypatch.setattr(settings, "notifi_inference_lock_timeout_seconds", 0.1)
+    monkeypatch.setattr(settings, "notifi_calibration_lock_timeout_seconds", 5.0)
+
+    model = FakeModel(delay=1.0)
+    model.fit_calibration = lambda device_id, absence, support: FakeProfile(device_id)
+    runtime = ModelRuntime(model, FakeRegistry(tmp_path))
+
+    # 추론이 1초 동안 락을 잡고 있어도 캘리브레이션은 5초까지 기다려 성공한다
+    blocker = threading.Thread(target=runtime.predict_npz, args=("care-1", make_npz()))
+    blocker.start()
+    assert model.started.wait(timeout=5)
+
+    summary = runtime.fit_calibration_npz("care-1", make_calibration_npz())
+    assert summary["link_coverage"] == [0.9, 0.9, 0.9]
+    assert (tmp_path / "care-1" / "calibration.pt").exists()
+    blocker.join(timeout=10)
+
+
+def test_calibration_releases_lock_on_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "notifi_calibration_lock_timeout_seconds", 5.0)
+
+    def explode(device_id, absence, support):
+        raise RuntimeError("fit blew up")
+
+    model = FakeModel()
+    model.fit_calibration = explode
+    runtime = ModelRuntime(model, FakeRegistry(tmp_path))
+
+    with pytest.raises(RuntimeError):
+        runtime.fit_calibration_npz("care-1", make_calibration_npz())
+
+    assert runtime.inflight_seconds() is None
+    # 락이 남지 않아 다음 추론이 곧바로 된다
+    runtime.predict_npz("care-1", make_npz())
 
 
 def test_lock_released_when_inference_raises(npz):
