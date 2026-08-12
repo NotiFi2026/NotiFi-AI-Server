@@ -54,6 +54,8 @@ class StreamPump:
         self._stop = threading.Event()
         #: 디바이스별 마지막으로 처리한 윈도 끝 — 같은 구간을 두 번 추론하지 않는다
         self._last_end: dict[str, float] = {}
+        #: 수집 시작 시각. 버퍼가 한 윈도를 채우기 전에는 판정하지 않는다
+        self._started_at: float | None = None
         self.stats = {"lines": 0, "packets": 0, "windows": 0, "sent": 0, "skipped_cooldown": 0}
 
     # ── 수명주기 ────────────────────────────────────────────────────────────
@@ -69,6 +71,7 @@ class StreamPump:
             replay_loop=self._config.notifi_stream_replay_loop,
         )
         self._stop.clear()
+        self._started_at = time.monotonic()
         self._reader = threading.Thread(target=self._read_loop, name="csi-reader", daemon=True)
         self._reader.start()
         self._task = asyncio.create_task(self._window_loop())
@@ -140,13 +143,17 @@ class StreamPump:
         if end is None:
             return
 
-        # 아직 한 윈도를 채울 만큼 안 모였으면 기다린다 — 반쪽 윈도는 결측투성이라 판정이 무의미하다
+        # 아직 한 윈도를 채울 만큼 안 모였으면 기다린다.
+        # 반쪽 윈도는 결측투성이라 저품질로 강등되고, 강등된 danger는 경보를 못 울린다 —
+        # 기동 직후 몇 초를 판정에 쓰면 그 시간이 통째로 사각지대가 된다.
+        # (monotonic()의 원점은 임의라 `end < window_seconds` 같은 비교는 성립하지 않는다.)
+        if self._started_at is None or end - self._started_at < spec.window_seconds:
+            return
+
         start = end - spec.window_seconds
         previous = self._last_end.get(device_id)
         if previous is not None and end - previous < self._config.notifi_stream_stride_seconds:
             return  # 새 데이터가 stride만큼 쌓이지 않았다
-        if previous is None and end < spec.window_seconds:
-            return
 
         per_link_times, per_link_iq = buffer.window(start, end)
         if not any(len(times) for times in per_link_times):
