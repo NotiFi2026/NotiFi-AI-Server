@@ -59,7 +59,8 @@ def test_event_type_mapping_covers_all_17_actions(index, label):
     )
 
     assert result.event_type is expected
-    assert result.features["activity_class"] == label.upper()
+    # 정식 필드로 실린다 — features dict의 매직 키가 아니다
+    assert result.activity_class == label.upper()
 
 
 def test_risk_score_formula():
@@ -117,6 +118,21 @@ def test_payload_sends_activity_class_as_field_not_feature():
     assert "activity_class" not in (payload["features"] or {})
 
 
+def test_unknown_risk_label_raises_contract_error():
+    """모델이 계약 밖 값을 내면 입력 오류(400)가 아니라 서버 오류로 올라가야 한다."""
+    from app.model.errors import ModelContractError
+
+    with pytest.raises(ModelContractError):
+        pipeline.to_model_result(make_pred(risk_label="explosive"), 1, None, NOW)
+
+
+def test_naive_datetime_is_rejected():
+    """naive 시각을 astimezone()에 넣으면 로컬시간으로 해석돼 9시간 어긋난다."""
+    naive = datetime(2026, 8, 12, 3, 22, 0)
+    with pytest.raises(ValueError):
+        pipeline.to_iso_ms(naive)
+
+
 def test_payload_detected_at_is_millisecond_precision():
     from app.agent import escalation_agent
 
@@ -165,17 +181,17 @@ def test_first_normal_is_sent():
 
 
 def test_same_class_within_interval_is_skipped():
-    pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW)
+    pipeline.mark_sent("d1", "WALKING", NOW)
     assert pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW + timedelta(seconds=60)) is False
 
 
 def test_class_change_is_sent_immediately():
-    pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW)
+    pipeline.mark_sent("d1", "WALKING", NOW)
     assert pipeline.should_send("d1", EventType.NORMAL, "SITTING_STILL", NOW + timedelta(seconds=1)) is True
 
 
 def test_same_class_after_interval_is_sent():
-    pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW)
+    pipeline.mark_sent("d1", "WALKING", NOW)
     assert pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW + timedelta(seconds=301)) is True
 
 
@@ -186,8 +202,22 @@ def test_abnormal_events_are_never_throttled(event_type):
 
 
 def test_throttle_is_per_device():
-    pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW)
+    pipeline.mark_sent("d1", "WALKING", NOW)
     assert pipeline.should_send("d2", EventType.NORMAL, "WALKING", NOW) is True
+
+
+def test_should_send_does_not_record_by_itself():
+    """판정만으로 기록되면 Spring 적재가 실패해도 다음 윈도가 막혀 2건이 유실된다."""
+    assert pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW) is True
+    # 적재가 실패해 mark_sent를 부르지 않은 상황 — 다음 윈도는 여전히 보내야 한다
+    assert pipeline.should_send("d1", EventType.NORMAL, "WALKING", NOW + timedelta(seconds=10)) is True
+
+
+def test_tracked_devices_are_bounded():
+    """device_id는 호출자가 정하는 문자열이라 상한이 없으면 무한히 쌓인다."""
+    for i in range(pipeline._MAX_TRACKED_DEVICES + 50):
+        pipeline.mark_sent(f"device-{i}", "WALKING", NOW)
+    assert len(pipeline._last_sent) <= pipeline._MAX_TRACKED_DEVICES
 
 
 # ── 에이전트 연계 ───────────────────────────────────────────────────────────
