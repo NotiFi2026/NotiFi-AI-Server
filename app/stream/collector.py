@@ -88,6 +88,12 @@ class CalibrationSession:
         }
 
 
+#: 이 밑이면 트라이얼로 받지 않는다. 반쪽짜리 윈도가 absence 기준선에 섞이면
+#: 이후 모든 판정이 조용히 틀어진다 — 커버리지를 응답에 실어 보내는 것만으로는 부족하다.
+#: 위저드가 경고를 무시하면 그대로 들어가기 때문이다.
+MIN_TRIAL_COVERAGE = 0.3
+
+
 class SessionStore:
     """디바이스별 캘리브레이션 세션. 캡처는 버퍼에서 윈도를 한 장 뜨는 것뿐이다."""
 
@@ -123,6 +129,16 @@ class SessionStore:
             raise NotEnoughSignal("윈도 구간에 패킷이 없다")
 
         csi, link_mask = window_from_packets(per_link_times, per_link_iq, spec, end)
+
+        # 데몬이 막 켜졌거나 신호가 끊기면 윈도의 대부분이 결측이다. 그런 트라이얼을 담으면
+        # 기준선이 오염되고, 그 뒤 판정이 전부 틀어지는데 원인을 찾기가 매우 어렵다.
+        usable = float(link_mask.any(axis=1).mean())
+        if usable < MIN_TRIAL_COVERAGE:
+            raise NotEnoughSignal(
+                f"유효 프레임 {usable:.0%} — {MIN_TRIAL_COVERAGE:.0%} 이상 필요. "
+                "보드 전원·거리를 확인하고 잠시 뒤 다시 시도하라"
+            )
+
         trial = Trial(csi=csi, link_mask=link_mask, action_id=action_id, captured_at=time.monotonic())
 
         session = self.get(device_id)

@@ -96,11 +96,15 @@ class ReplaySource:
                 offset_ms = float(stamp)
                 if base_ms is None:
                     base_ms = offset_ms
-                # 원래 간격대로 흘려보낸다 — 몰아서 주면 링크 커버리지가 실제와 달라진다
+                # 원래 간격대로 흘려보낸다 — 몰아서 주면 링크 커버리지가 실제와 달라진다.
+                # 길게 한 번 자면 종료가 그만큼 늦어지므로 잘게 쪼개 자며 종료를 확인한다
+                # (통째로 min(delay, 1)로 자르면 1초 넘는 간격이 압축돼 페이싱이 깨진다).
                 due = (offset_ms - base_ms) / 1000.0 / self._speed
-                delay = due - (time.monotonic() - started)
-                if delay > 0:
-                    time.sleep(min(delay, 1.0))
+                while not self._closed:
+                    delay = due - (time.monotonic() - started)
+                    if delay <= 0:
+                        break
+                    time.sleep(min(delay, 0.2))
                 yield line
 
     def close(self) -> None:

@@ -56,6 +56,8 @@ class StreamPump:
         self._last_end: dict[str, float] = {}
         #: 수집 시작 시각. 버퍼가 한 윈도를 채우기 전에는 판정하지 않는다
         self._started_at: float | None = None
+        #: 진행 중인 에스컬레이션 에이전트 태스크. GC로 사라지지 않게 붙잡아 둔다
+        self._agent_tasks: set[asyncio.Task] = set()
         self.stats = {"lines": 0, "packets": 0, "windows": 0, "sent": 0, "skipped_cooldown": 0}
 
     # ── 수명주기 ────────────────────────────────────────────────────────────
@@ -98,6 +100,13 @@ class StreamPump:
         if self._reader is not None:
             # 시리얼 timeout이 0.5초라 그 안에 빠져나온다. 안 죽어도 daemon 스레드라 종료를 막지 않는다
             self._reader.join(timeout=3.0)
+        if self._agent_tasks:
+            # 진행 중인 응급 대응은 취소하지 않는다 — 119 신고 직전에 끊는 셈이 된다.
+            # 서버가 정말 내려가면 어차피 같이 죽지만, 그 사실은 남겨야 원인을 안다.
+            logger.warning(
+                "정지 시점에 진행 중인 에스컬레이션이 있다",
+                extra={"action": "stream_stop_with_active_agents", "count": len(self._agent_tasks)},
+            )
         logger.info("수집 데몬 정지", extra={"action": "stream_stopped", **self.stats})
 
     # ── 수신 ────────────────────────────────────────────────────────────────
@@ -202,13 +211,24 @@ class StreamPump:
         window_end: float,
         coverage: list[float],
     ) -> None:
-        """판정 결과를 Spring으로. 위험 판정은 쿨다운으로 중복 신고를 막는다."""
-        risk_label = pred.get("risk_label")
-        is_danger = risk_label == RiskLevel.DANGER.value
+        """판정 결과를 Spring으로. 위험 판정은 쿨다운으로 중복 신고를 막는다.
 
-        if is_danger and not self.cooldown.allows(device_id, window_end):
-            # Spring은 DANGER 이벤트마다 에스컬레이션을 새로 만든다(중복 판정 없음).
-            # 겹치는 윈도를 그대로 보내면 한 번 넘어졌는데 119 신고가 여러 번 걸린다.
+        **억제 판단은 강등이 끝난 뒤에 한다.** 모델 원본 라벨로 판단하면, 저품질이라 WARNING으로
+        내려가 에스컬레이션을 만들지도 않은 윈도가 쿨다운을 걸어버린다. 그 사이에 일어난
+        진짜 낙상은 억제되어 아무에게도 알려지지 않는다.
+        """
+        # 버퍼 시각은 monotonic이라 벽시계로 되돌린다. 처리 직후라 보정폭은 수십 ms다
+        detected_at = datetime.now(timezone.utc) - timedelta(
+            seconds=max(0.0, time.monotonic() - window_end)
+        )
+
+        def gate(model_result: Any) -> bool:
+            """Spring은 DANGER 이벤트마다 에스컬레이션을 새로 만든다(중복 판정 없음).
+            겹치는 윈도를 그대로 보내면 한 번 넘어졌는데 119 신고가 여러 번 걸린다."""
+            if model_result.risk_level is not RiskLevel.DANGER:
+                return True
+            if self.cooldown.allows(device_id, window_end):
+                return True
             self.stats["skipped_cooldown"] += 1
             logger.info(
                 "위험 재신고 억제",
@@ -218,12 +238,7 @@ class StreamPump:
                     "remaining_seconds": round(self.cooldown.remaining(device_id, window_end), 1),
                 },
             )
-            return
-
-        # 버퍼 시각은 monotonic이라 벽시계로 되돌린다. 처리 직후라 보정폭은 수십 ms다
-        detected_at = datetime.now(timezone.utc) - timedelta(
-            seconds=max(0.0, time.monotonic() - window_end)
-        )
+            return False
 
         try:
             result = await ingest_service.deliver(
@@ -233,6 +248,7 @@ class StreamPump:
                 spring_device_id=None,
                 detected_at=detected_at,
                 schedule_danger=self._schedule_danger,
+                gate=gate,
             )
         except ModelContractError as exc:
             logger.error(
@@ -251,8 +267,9 @@ class StreamPump:
 
         if result.get("sent"):
             self.stats["sent"] += 1
-            if is_danger:
-                # 실제로 적재된 뒤에만 쿨다운을 건다 — 실패까지 세면 사고가 통째로 유실된다
+            if result.get("escalation_triggered"):
+                # Spring이 실제로 에스컬레이션을 시작했을 때만 억제한다 —
+                # "적재됐다"나 "모델이 danger라 했다"가 아니라 이게 유일하게 정직한 신호다
                 self.cooldown.mark(device_id, window_end)
             logger.info(
                 "실시간 판정 적재",
@@ -267,7 +284,14 @@ class StreamPump:
             )
 
     def _schedule_danger(self, model_result: Any, saved: dict[str, Any]) -> None:
-        """에이전트는 수 분짜리 흐름이라 윈도 루프를 붙잡으면 안 된다."""
+        """에이전트는 수 분짜리 흐름이라 윈도 루프를 붙잡으면 안 된다.
+
+        **반환된 태스크를 반드시 붙잡아 둔다.** 이벤트 루프는 태스크를 약한 참조로만 들고 있어서,
+        참조를 버리면 실행 도중 GC 대상이 된다. 에스컬레이션은 음성확인 → 60초 대기 → 보호자
+        알림 → 119로 이어지는 흐름이라, 사라지면 **119 신고 직전에 조용히 멈춘다.**
+        """
         from app.api.routes import run_agent_safely
 
-        asyncio.create_task(run_agent_safely(model_result, saved))
+        task = asyncio.create_task(run_agent_safely(model_result, saved))
+        self._agent_tasks.add(task)
+        task.add_done_callback(self._agent_tasks.discard)
