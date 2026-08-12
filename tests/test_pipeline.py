@@ -133,6 +133,23 @@ def test_naive_datetime_is_rejected():
         pipeline.to_iso_ms(naive)
 
 
+def test_model_result_rejects_naive_detected_at():
+    """계약을 스키마에서 강제한다 — 두 진입점(agent/run, ingest)을 한 곳에서 덮는다."""
+    from app.agent.schemas import EventType as ET, ModelResult, RiskLevel as RL
+
+    with pytest.raises(ValueError):
+        ModelResult(
+            care_target_id=1,
+            event_type=ET.FALL,
+            label="fall_from_standing",
+            risk_level=RL.DANGER,
+            confidence=0.9,
+            risk_score=90,
+            model_version="NotiFi_AI_v1",
+            detected_at=datetime(2026, 8, 12, 3, 22, 0),
+        )
+
+
 def test_payload_detected_at_is_millisecond_precision():
     from app.agent import escalation_agent
 

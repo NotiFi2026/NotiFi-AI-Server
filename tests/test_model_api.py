@@ -163,6 +163,29 @@ def test_ingest_503_when_runtime_missing(client):
     assert res.status_code == 503
 
 
+def test_agent_run_rejects_naive_detected_at(client):
+    """오프셋 없는 시각은 파싱 단계에서 거부해야 한다.
+
+    통과시키면 202를 반환한 뒤 백그라운드에서 예외가 삼켜져
+    낙상 이벤트가 "접수됨"으로 응답되고 실제로는 사라진다.
+    """
+    res = client.post(
+        "/internal/agent/run",
+        headers={"X-Internal-Key": KEY},
+        json={
+            "care_target_id": 1,
+            "event_type": "FALL",
+            "label": "fall_from_standing",
+            "risk_level": "danger",
+            "confidence": 0.9,
+            "risk_score": 90,
+            "model_version": "NotiFi_AI_v1",
+            "detected_at": "2026-08-12T03:22:00",
+        },
+    )
+    assert res.status_code == 422
+
+
 def test_agent_run_rejects_wrong_key(client):
     """기존 엔드포인트도 같은 인증 헬퍼를 쓴다.
 

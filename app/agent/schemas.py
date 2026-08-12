@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class RiskLevel(str, Enum):
@@ -52,6 +52,19 @@ class ModelResult(BaseModel):
     context_features: Optional[dict[str, Any]] = None
     features: Optional[dict[str, Any]] = None
     language: str = "ko"
+
+    @field_validator("detected_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        """계약: detected_at은 오프셋 필수.
+
+        여기서 막지 않으면 오프셋 없는 시각이 파싱을 통과해 요청은 202를 받고,
+        나중에 payload 조립 단계에서 터진 예외가 백그라운드에서 삼켜진다 —
+        낙상 이벤트가 "접수됨"으로 응답되고 실제로는 사라진다.
+        """
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise ValueError("detected_at requires a timezone offset")
+        return value
 
 
 class GuardianMessage(BaseModel):
