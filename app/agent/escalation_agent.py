@@ -30,6 +30,7 @@ class EscalationState(TypedDict):
     care_target_id: int
     device_id: Optional[int]
     event_type: str
+    activity_class: Optional[str]
     label: str
     risk_level: str
     confidence: float
@@ -443,6 +444,7 @@ def initial_state(
         "care_target_id": model_result.care_target_id,
         "device_id": model_result.device_id,
         "event_type": model_result.event_type.value,
+        "activity_class": model_result.activity_class,
         "label": model_result.label,
         "risk_level": model_result.risk_level.value,
         "confidence": model_result.confidence,

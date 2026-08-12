@@ -40,6 +40,9 @@ class ModelResult(BaseModel):
     care_target_id: int
     device_id: Optional[int] = None
     event_type: EventType
+    # AI v1 17행동 세부 분류(대문자). I1의 정식 필드로 나간다 —
+    # features dict에 실어 보내면 키 이름이 어긋나도 조용히 null로 적재된다.
+    activity_class: Optional[str] = None
     label: str
     risk_level: RiskLevel
     confidence: float
