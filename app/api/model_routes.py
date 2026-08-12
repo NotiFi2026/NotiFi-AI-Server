@@ -2,11 +2,21 @@
 from __future__ import annotations
 
 import re
+import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, Request
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
@@ -100,8 +110,18 @@ class DeviceRegisterRequest(BaseModel):
     notes: str = ""
 
 
-def _calibration_warnings(summary: dict[str, Any], absence_expected: int = 12) -> list[str]:
-    """설치 품질 경고. 거부하지 않고 알린다 — 재시도로 덮어쓸 수 있다."""
+# 캘리브레이션은 업로드·압축해제만으로 요청당 수십 MB를 쓴다. 모델 락은 학습 구간만
+# 막으므로, 그 앞단까지 포함해 동시 1건으로 제한한다.
+_calibration_slot = threading.Semaphore(1)
+
+# 모델 문서 §3.4 수집 규모
+_ABSENCE_EXPECTED = 12
+_BASIC_ACTIONS = (0, 1, 2, 3, 4, 5, 7, 8)
+_BASIC_REPEATS = 2
+
+
+def _calibration_warnings(summary: dict[str, Any]) -> list[str]:
+    """설치 품질·수집 규모 경고. 거부하지 않고 알린다 — 재시도로 덮어쓸 수 있다."""
     warnings: list[str] = []
     valid_links = sum(1 for ok in summary.get("baseline_link_valid", []) if ok)
     if valid_links < 2:
@@ -114,6 +134,19 @@ def _calibration_warnings(summary: dict[str, Any], absence_expected: int = 12) -
     ]
     if weak:
         warnings.append(f"링크 커버리지 부족: TX{[i + 1 for i in weak]}")
+
+    absence = summary.get("absence_trials")
+    if absence is not None and absence < _ABSENCE_EXPECTED:
+        warnings.append(f"무인 트라이얼 {absence}회 — 권장 {_ABSENCE_EXPECTED}회(각 10초)")
+
+    counts = summary.get("support_action_counts")
+    if counts:
+        missing = [
+            action for action in _BASIC_ACTIONS
+            if action < len(counts) and counts[action] < _BASIC_REPEATS
+        ]
+        if missing:
+            warnings.append(f"기본 동작 수집 부족(각 {_BASIC_REPEATS}회 권장): action {missing}")
     return warnings
 
 
@@ -138,12 +171,28 @@ async def register_device(
         "notes": body.notes,
     }
     try:
-        await run_in_threadpool(runtime.register_device, config)
+        result = await run_in_threadpool(runtime.register_device, config)
     except (TypeError, ValueError) as exc:
         # 보드 ID 중복·공백 등 — 계약 위반 내용은 그대로 알려줘야 고칠 수 있다
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return {"device_id": device_id, "care_target_id": body.care_target_id}
+    return {"care_target_id": body.care_target_id, **result}
+
+
+@router.delete("/devices/{device_id}")
+async def delete_device(
+    request: Request,
+    device_id: str,
+    x_internal_key: str = Header(default=""),
+) -> dict:
+    """등록·캘리브레이션을 함께 제거한다. 재설치와 파생 상태 정리에 쓴다."""
+    check_internal_key(x_internal_key)
+    if not _DEVICE_ID.match(device_id):
+        raise HTTPException(status_code=400, detail="Invalid device_id")
+    runtime = _runtime(request)
+    if not await run_in_threadpool(runtime.delete_device, device_id):
+        raise HTTPException(status_code=404, detail="Device not found")
+    return {"device_id": device_id, "deleted": True}
 
 
 @router.get("/devices/{device_id}")
@@ -168,24 +217,31 @@ async def device_status(
 async def calibrate(
     request: Request,
     device_id: str,
-    file: bytes = File(...),
+    file: UploadFile = File(...),
     x_internal_key: str = Header(default=""),
 ) -> dict:
     """캘리브레이션 NPZ로 프로필을 학습한다.
 
     absence_csi/absence_mask 필수, support_* 선택. 트라이얼당 ~0.79MiB라
-    추론(8MiB)과 다른 상한을 쓴다.
+    추론(8MiB)과 다른 상한을 쓴다. 업로드를 메모리에 통째로 올리지 않도록
+    UploadFile(1MiB 초과분은 디스크 스풀)을 그대로 넘긴다.
     """
     check_internal_key(x_internal_key)
     if not _DEVICE_ID.match(device_id):
         raise HTTPException(status_code=400, detail="Invalid device_id")
     limit = settings.notifi_calibration_max_upload_mb * 1024 * 1024
-    if len(file) > limit:
+    if file.size is not None and file.size > limit:
         raise HTTPException(status_code=413, detail="Upload too large")
 
     runtime = _runtime(request)
+    if not _calibration_slot.acquire(blocking=False):
+        # 업로드·압축해제만으로 요청당 수십 MB다. 모델 락은 학습 구간만 막으므로
+        # 여기서 막지 않으면 동시 요청이 메모리를 밀어낸다.
+        raise HTTPException(status_code=503, detail="Another calibration is in progress")
     try:
-        summary = await run_in_threadpool(runtime.fit_calibration_npz, device_id, file)
+        summary = await run_in_threadpool(
+            runtime.fit_calibration_npz, device_id, file.file
+        )
     except InferenceBusyError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (FileNotFoundError, KeyError, ValueError) as exc:
@@ -205,6 +261,8 @@ async def calibrate(
             exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Calibration failed") from exc
+    finally:
+        _calibration_slot.release()
 
     warnings = _calibration_warnings(summary)
     return {"device_id": device_id, "usable": not warnings, "warnings": warnings, **summary}
