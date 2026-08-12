@@ -21,6 +21,7 @@ from fastapi import (
 from app.agent import escalation_agent
 from app.agent.payload_builder import build_sensing_event_payload
 from app.agent.schemas import EventType, RiskLevel
+from app.api.auth import check_internal_key
 from app.api.model_routes._common import get_runtime, guard_inference, run_inference
 from app.api.routes import run_agent_safely
 from app.clients import spring_client
@@ -73,6 +74,17 @@ async def model_health(request: Request, x_internal_key: str = Header(default=""
         body["inflight_seconds"] = inflight
         body["last_success_age_seconds"] = runtime.last_success_age_seconds()
     return body
+
+
+@router.get("/spec")
+async def model_spec(request: Request, x_internal_key: str = Header(default="")) -> dict:
+    """모델이 말하는 계약 — 행동 라벨·위험 등급·관절 스키마·입력 형상.
+
+    모델은 계속 갱신되므로 하위(Spring·앱·수집 데몬)가 자기 가정이 아직 맞는지
+    런타임에 확인할 수 있어야 한다. 스모크 테스트도 이걸 보고 어긋남을 조기 발견한다.
+    """
+    check_internal_key(x_internal_key)
+    return get_runtime(request).spec.as_dict()
 
 
 @router.post("/devices/{device_id}/predict")

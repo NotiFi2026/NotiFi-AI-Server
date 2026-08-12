@@ -1,7 +1,7 @@
 """추론 락 대기 한도와 멈춤 관측.
 
 notifi_ai가 없는 환경(부팅은 되어야 한다)에서는 통째로 건너뛴다.
-아티팩트·GPU는 필요 없다 — ModelRuntime 생성자가 (model, registry)를 받으므로 가짜로 채운다.
+아티팩트·GPU는 필요 없다 — ModelRuntime 생성자가 (model, registry, spec)을 받으므로 가짜로 채운다.
 """
 import io
 import threading
@@ -15,6 +15,7 @@ pytest.importorskip("notifi_ai")
 from app.config import settings  # noqa: E402
 from app.model.errors import InferenceBusyError  # noqa: E402
 from app.model.runtime import ModelRuntime  # noqa: E402
+from tests.conftest import FAKE_SPEC  # noqa: E402
 
 
 def make_npz() -> bytes:
@@ -81,7 +82,7 @@ def test_busy_when_lock_held_beyond_timeout(monkeypatch, npz):
     """앞 추론이 길면 뒤 요청은 무한 대기 대신 한도 안에 포기한다."""
     monkeypatch.setattr(settings, "notifi_inference_lock_timeout_seconds", 0.2)
     model = FakeModel(delay=2.0)
-    runtime = ModelRuntime(model, FakeRegistry())
+    runtime = ModelRuntime(model, FakeRegistry(), FAKE_SPEC)
 
     blocker = threading.Thread(target=runtime.predict_npz, args=("home-001", npz))
     blocker.start()
@@ -98,7 +99,7 @@ def test_busy_when_lock_held_beyond_timeout(monkeypatch, npz):
 
 def test_inflight_seconds_reports_running_inference(npz):
     model = FakeModel(delay=1.0)
-    runtime = ModelRuntime(model, FakeRegistry())
+    runtime = ModelRuntime(model, FakeRegistry(), FAKE_SPEC)
     assert runtime.inflight_seconds() is None
 
     worker = threading.Thread(target=runtime.predict_npz, args=("home-001", npz))
@@ -110,7 +111,7 @@ def test_inflight_seconds_reports_running_inference(npz):
 
 
 def test_lock_released_and_state_cleared_after_success(npz):
-    runtime = ModelRuntime(FakeModel(), FakeRegistry())
+    runtime = ModelRuntime(FakeModel(), FakeRegistry(), FAKE_SPEC)
     runtime.predict_npz("home-001", npz)
 
     assert runtime.inflight_seconds() is None
@@ -137,7 +138,7 @@ def test_calibration_uses_its_own_lock_timeout(monkeypatch, tmp_path):
 
     model = FakeModel(delay=1.0)
     model.fit_calibration = lambda device_id, absence, support: FakeProfile(device_id)
-    runtime = ModelRuntime(model, FakeRegistry(tmp_path))
+    runtime = ModelRuntime(model, FakeRegistry(tmp_path), FAKE_SPEC)
 
     # 추론이 1초 동안 락을 잡고 있어도 캘리브레이션은 5초까지 기다려 성공한다
     blocker = threading.Thread(target=runtime.predict_npz, args=("care-1", make_npz()))
@@ -158,7 +159,7 @@ def test_calibration_releases_lock_on_failure(monkeypatch, tmp_path):
 
     model = FakeModel()
     model.fit_calibration = explode
-    runtime = ModelRuntime(model, FakeRegistry(tmp_path))
+    runtime = ModelRuntime(model, FakeRegistry(tmp_path), FAKE_SPEC)
 
     with pytest.raises(RuntimeError):
         runtime.fit_calibration_npz("care-1", make_calibration_npz())
@@ -173,7 +174,7 @@ def test_lock_released_when_inference_raises(npz):
         def predict(self, csi, link_mask, calibration=None):
             raise RuntimeError("cuda blew up")
 
-    runtime = ModelRuntime(Exploding(), FakeRegistry())
+    runtime = ModelRuntime(Exploding(), FakeRegistry(), FAKE_SPEC)
     with pytest.raises(RuntimeError):
         runtime.predict_npz("home-001", npz)
 

@@ -39,6 +39,8 @@ def make_pred(
         "frame_valid": [True] * frames,
         "joints": [f"j{i}" for i in range(22)],
         "fps": 30.0,
+        # 런타임이 ModelSpec에서 실어 보내는 값 — 파이프라인에 상수로 박지 않는다
+        "joint_schema": "smpl-22",
     }
 
 

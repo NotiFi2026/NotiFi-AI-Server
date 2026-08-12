@@ -4,6 +4,8 @@ notifi_ai 패키지의 create_app(api.py)이 하던 구성(모델 + 레지스트
 번들 구현이 빠뜨린 두 가지를 여기서 보강한다:
   - 기동 시 warmup 호출 (첫 CUDA 요청이 수십 초 걸리는 것을 없앤다)
   - 블로킹 추론을 이벤트 루프 밖에서 실행 (호출부에서 run_in_threadpool)
+
+모델 패키지 자체는 직접 만지지 않는다 — 전부 `app.model.adapter`를 거친다.
 """
 from __future__ import annotations
 
@@ -15,23 +17,28 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from notifi_ai import NotiFiAIv1
-from notifi_ai.constants import ACTION_TO_RISK, JOINT_NAMES, TARGET_FPS
-from notifi_ai.io import load_calibration_npz, load_query_npz
-from notifi_ai.registry import DeviceRegistry
-from notifi_ai.schemas import DeviceConfig
-
 from app.common.logging_config import logger
 from app.config import Settings, settings
+from app.model.adapter import (
+    DeviceConfig,
+    DeviceRegistry,
+    ModelSpec,
+    build_spec,
+    load_calibration_npz,
+    load_model,
+    load_query_npz,
+)
 from app.model.errors import InferenceBusyError
 
 
 class ModelRuntime:
     """로드된 모델 1개 + 디바이스 레지스트리 + 추론 직렬화 락."""
 
-    def __init__(self, model: NotiFiAIv1, registry: DeviceRegistry) -> None:
+    def __init__(self, model: Any, registry: DeviceRegistry, spec: ModelSpec) -> None:
         self._model = model
         self._registry = registry
+        # 스펙 없이는 결과에 라벨을 못 붙인다 — 선택 인자로 두면 추론 도중에야 터진다
+        self.spec = spec
         # 모델은 스레드 안전하지 않다 — 모든 추론을 직렬화한다
         self._lock = threading.Lock()
         # 진행 상태. 단일 대입/읽기라 GIL 하에서 원자적이고, 관측용이라
@@ -46,12 +53,16 @@ class ModelRuntime:
         파라미터명이 `settings`면 모듈 전역 settings를 섀도잉해, 같은 클래스가
         설정을 두 경로로 받는 것처럼 보인다.
         """
-        model = NotiFiAIv1(
+        model = load_model(
             artifact_dir=config.notifi_artifact_dir,
             device=config.notifi_model_device,
+            class_name=config.notifi_model_class,
         )
+        # 계약 검증이 warmup보다 먼저다 — 매핑이 어긋난 모델로 워밍업까지 하고 나서
+        # 실패하면 수십 초를 버린다
+        spec = build_spec(model)
         model.warmup()
-        return cls(model, DeviceRegistry(config.notifi_registry_root))
+        return cls(model, DeviceRegistry(config.notifi_registry_root), spec)
 
     def describe(self) -> dict[str, Any]:
         return self._model.describe()
@@ -255,12 +266,21 @@ class ModelRuntime:
                 "low_quality": prediction.quality.get("low_quality"),
             },
         )
-        result = prediction.to_dict(include_pose=include_pose)
-        # 변환 계층이 notifi_ai에 의존하지 않도록 필요한 상수를 여기서 실어 보낸다.
-        # action_risk_id는 행동의 정적 카테고리(0 safe/1 warning/2 danger)로,
-        # 독립 위험도 헤드(risk_label)와 다르다 — event_type 매핑에 쓴다.
-        result["action_risk_id"] = ACTION_TO_RISK[prediction.action_id]
+        return self._decorate(prediction.to_dict(include_pose=include_pose),
+                             prediction.action_id, include_pose)
+
+    def _decorate(self, result: dict[str, Any], action_id: int, include_pose: bool) -> dict[str, Any]:
+        """변환 계층이 notifi_ai를 모르도록, 계약값을 결과 dict에 실어 보낸다.
+
+        action_risk_id는 행동의 정적 카테고리(0 safe/1 warning/2 danger)로,
+        독립 위험도 헤드(risk_label)와 다르다 — event_type 매핑에 쓴다.
+        """
+        spec = self.spec
+        result["action_risk_id"] = spec.action_to_risk[action_id]
         if include_pose:
-            result["joints"] = list(JOINT_NAMES)
-            result["fps"] = TARGET_FPS
+            result["joints"] = list(spec.joint_names)
+            result["fps"] = spec.fps
+            # 스키마를 여기서 붙여야 모델이 바뀌면 저장되는 라벨도 같이 바뀐다.
+            # 파이프라인에 상수로 박아두면 v2에서 거짓 라벨이 적재된다.
+            result["joint_schema"] = spec.joint_schema
         return result

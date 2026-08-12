@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # None이면 cuda 우선 자동 선택. artifact_dir도 None이면 패키지 기본 경로
     notifi_model_device: str | None = None
     notifi_artifact_dir: str | None = None
+    # 모델 클래스명이 버전을 달고 있어(NotiFiAIv1) 새 모델은 이름이 바뀐다.
+    # 설정으로 두면 v2 교체가 환경변수 한 줄이다.
+    notifi_model_class: str = "NotiFiAIv1"
     # 패키지 기본값 "runtime/devices"는 cwd 의존이라 절대 경로로 고정한다
     notifi_registry_root: str = str(_REPO_ROOT / "runtime" / "devices")
     # 같은 행동이 이어질 때 NORMAL 이벤트를 다시 보내기까지의 간격

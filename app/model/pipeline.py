@@ -17,12 +17,8 @@ from app.model.errors import ModelContractError
 # 행동의 정적 카테고리(safe 9 / warning 3 / danger 5) → Spring event_type
 _RISK_ID_TO_EVENT = (EventType.NORMAL, EventType.ANOMALY, EventType.FALL)
 
-JOINT_SCHEMA = "smpl-22"
-
 # Spring은 risk_probability를 @Digits(fraction=3)로 받는다 — 4자리 이상이면 400
 PROBABILITY_DIGITS = 3
-
-DEFAULT_MODEL_VERSION = "NotiFi_AI_v1"
 
 
 def round_probability(value: float | None) -> float | None:
@@ -91,7 +87,7 @@ def to_model_result(
         risk_level=risk_level,
         confidence=round_probability(quality.get("risk_confidence", 0.0)),
         risk_score=max(0, min(100, risk_score)),
-        model_version=pred.get("model_name", DEFAULT_MODEL_VERSION),
+        model_version=pred["model_name"],
         detected_at=detected_at,
         features=features,
     )
@@ -102,13 +98,17 @@ def build_pose_clip_payload(
     window_start_at: datetime,
     window_end_at: datetime,
 ) -> dict[str, Any]:
-    """I5 클립 페이로드. frames는 top-level JSON 객체여야 한다(배열 불가)."""
+    """I5 클립 페이로드. frames는 top-level JSON 객체여야 한다(배열 불가).
+
+    joint_schema·model_version은 런타임이 실어 보낸 값을 그대로 쓴다 — 여기 상수로 박으면
+    모델이 바뀌었을 때 거짓 라벨이 적재되고, 앱은 못 그리는 데이터를 그리려 든다.
+    """
     pose_rel = pred["pose_rel"]
     fps = pred["fps"]
     frame_count = len(pose_rel)
     return {
-        "model_version": pred.get("model_name", DEFAULT_MODEL_VERSION),
-        "joint_schema": JOINT_SCHEMA,
+        "model_version": pred["model_name"],
+        "joint_schema": pred["joint_schema"],
         "fps": round(fps),
         "frame_count": frame_count,
         "duration_ms": round(frame_count / fps * 1000),
