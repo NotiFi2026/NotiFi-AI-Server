@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 
 from app.agent import escalation_agent
 from app.agent.payload_builder import build_sensing_event_payload
@@ -80,6 +81,133 @@ async def _infer(
             exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Inference failed") from exc
+
+
+class DeviceRegisterRequest(BaseModel):
+    """설치 1채(RX 1 + TX 3 보드)의 등록 정보.
+
+    device_id는 서버가 care_target_id에서 파생한다 — 앱이 정하지 않는다.
+    보드 방향(RX=North/TX1=South/TX2=West/TX3=East)은 모델이 고정 계약으로 강제하므로
+    선택지로 노출하지 않는다.
+    """
+
+    care_target_id: int = Field(gt=0)
+    rx_id: str = Field(min_length=1, max_length=64)
+    tx1_id: str = Field(min_length=1, max_length=64)
+    tx2_id: str = Field(min_length=1, max_length=64)
+    tx3_id: str = Field(min_length=1, max_length=64)
+    firmware_version: str = "unknown"
+    notes: str = ""
+
+
+def _calibration_warnings(summary: dict[str, Any], absence_expected: int = 12) -> list[str]:
+    """설치 품질 경고. 거부하지 않고 알린다 — 재시도로 덮어쓸 수 있다."""
+    warnings: list[str] = []
+    valid_links = sum(1 for ok in summary.get("baseline_link_valid", []) if ok)
+    if valid_links < 2:
+        warnings.append(
+            f"유효 링크 {valid_links}개 — 최소 2개 필요. 케이블·전원·안테나·sender ID를 확인하라"
+        )
+    weak = [
+        index for index, coverage in enumerate(summary.get("link_coverage", []))
+        if coverage < 0.35
+    ]
+    if weak:
+        warnings.append(f"링크 커버리지 부족: TX{[i + 1 for i in weak]}")
+    return warnings
+
+
+@router.post("/devices", status_code=201)
+async def register_device(
+    request: Request,
+    body: DeviceRegisterRequest,
+    x_internal_key: str = Header(default=""),
+) -> dict:
+    """설치 1채를 등록한다. 캘리브레이션보다 먼저 호출해야 한다."""
+    check_internal_key(x_internal_key)
+    runtime = _runtime(request)
+
+    device_id = pipeline.device_id_for(body.care_target_id)
+    config = {
+        "device_id": device_id,
+        "rx_id": body.rx_id,
+        "tx1_id": body.tx1_id,
+        "tx2_id": body.tx2_id,
+        "tx3_id": body.tx3_id,
+        "firmware_version": body.firmware_version,
+        "notes": body.notes,
+    }
+    try:
+        await run_in_threadpool(runtime.register_device, config)
+    except (TypeError, ValueError) as exc:
+        # 보드 ID 중복·공백 등 — 계약 위반 내용은 그대로 알려줘야 고칠 수 있다
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"device_id": device_id, "care_target_id": body.care_target_id}
+
+
+@router.get("/devices/{device_id}")
+async def device_status(
+    request: Request,
+    device_id: str,
+    x_internal_key: str = Header(default=""),
+) -> dict:
+    """등록·캘리브레이션 진행 상태. 위저드가 어디부터 시작할지 판단한다."""
+    check_internal_key(x_internal_key)
+    if not _DEVICE_ID.match(device_id):
+        raise HTTPException(status_code=400, detail="Invalid device_id")
+    runtime = _runtime(request)
+    status = await run_in_threadpool(runtime.device_status, device_id)
+    if status.get("calibration"):
+        status["warnings"] = _calibration_warnings(status["calibration"])
+        status["usable"] = not status["warnings"]
+    return status
+
+
+@router.post("/devices/{device_id}/calibrate")
+async def calibrate(
+    request: Request,
+    device_id: str,
+    file: bytes = File(...),
+    x_internal_key: str = Header(default=""),
+) -> dict:
+    """캘리브레이션 NPZ로 프로필을 학습한다.
+
+    absence_csi/absence_mask 필수, support_* 선택. 트라이얼당 ~0.79MiB라
+    추론(8MiB)과 다른 상한을 쓴다.
+    """
+    check_internal_key(x_internal_key)
+    if not _DEVICE_ID.match(device_id):
+        raise HTTPException(status_code=400, detail="Invalid device_id")
+    limit = settings.notifi_calibration_max_upload_mb * 1024 * 1024
+    if len(file) > limit:
+        raise HTTPException(status_code=413, detail="Upload too large")
+
+    runtime = _runtime(request)
+    try:
+        summary = await run_in_threadpool(runtime.fit_calibration_npz, device_id, file)
+    except InferenceBusyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        # 미등록 디바이스·NPZ 계약 위반. 경로가 섞일 수 있어 본문은 일반 메시지로 둔다
+        logger.warning(
+            "캘리브레이션 입력 오류",
+            extra={"action": "calibration_rejected", "device_id": device_id, "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Device not registered or invalid calibration NPZ",
+        ) from exc
+    except Exception as exc:
+        logger.error(
+            "캘리브레이션 실패",
+            extra={"action": "calibration_failed", "device_id": device_id, "error": str(exc)},
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Calibration failed") from exc
+
+    warnings = _calibration_warnings(summary)
+    return {"device_id": device_id, "usable": not warnings, "warnings": warnings, **summary}
 
 
 @router.get("/health")
@@ -158,6 +286,13 @@ async def ingest(
     잇는 수단이 아직 없다. window_end_at도 모델이 시각을 모르므로 호출자가 준다(기본 now).
     """
     _guard(x_internal_key, device_id, file)
+    derived = pipeline.care_target_id_from(device_id)
+    if derived is not None and derived != care_target_id:
+        # device_id=care-5인데 care_target_id=7이면 응급 이벤트가 엉뚱한 노인에게 적재된다
+        raise HTTPException(
+            status_code=400,
+            detail=f"device_id targets care_target {derived}, not {care_target_id}",
+        )
     if window_end_at is not None and window_end_at.tzinfo is None:
         # naive 시각을 받아들이면 로컬시간으로 해석돼 detected_at이 조용히 어긋난다.
         # detected_at은 멱등키의 일부라 중복 판정까지 깨지므로 거부한다.
