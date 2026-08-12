@@ -20,6 +20,7 @@ from app.agent.schemas import EventType, GuardianMessage, NotificationLevel, Ris
 from app.clients import cartesia_client, spring_client, whisper_client
 from app.common.logging_config import logger
 from app.config import settings
+from app.model.pipeline import to_iso_ms
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -61,6 +62,10 @@ class EscalationState(TypedDict):
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
 async def _submit_sensing_event(state: EscalationState) -> dict:
+    if state.get("sensing_event_id") is not None:
+        # 파이프라인이 I5를 위해 이미 I1을 보내고 결과를 넘겨준 경우 — 재전송하지 않는다
+        return {}
+
     logger.info(
         "I1 요청",
         extra={
@@ -100,6 +105,19 @@ async def _submit_sensing_event(state: EscalationState) -> dict:
 
 async def _select_response_policy(state: EscalationState) -> dict:
     policy = select_policy(state["risk_level"])
+    if policy == "voice_check_required" and not state.get("escalation_id"):
+        # 멱등 재적재 등으로 Spring이 escalation_id를 주지 않은 경우.
+        # 그대로 진행하면 /escalations/None/steps 로 POST한다.
+        logger.error(
+            "danger인데 escalation_id 없음 — 단계 기록 없이 종료",
+            extra={
+                "action": "escalation_id_missing",
+                "care_target_id": state["care_target_id"],
+                "sensing_event_id": state.get("sensing_event_id"),
+            },
+        )
+        policy = "safe_record_only"
+
     logger.info(
         "대응 정책 선택",
         extra={
@@ -416,19 +434,12 @@ _builder.add_edge("finish", END)
 graph = _builder.compile()
 
 
-async def run(model_result: ModelResult) -> EscalationState:
-    """모델 결과를 받아 에스컬레이션 흐름을 실행한다."""
-    logger.info(
-        "모델 결과 수신",
-        extra={
-            "action": "model_result_received",
-            "care_target_id": model_result.care_target_id,
-            "event_type": model_result.event_type.value,
-            "risk_level": model_result.risk_level.value,
-            "confidence": model_result.confidence,
-        },
-    )
-    initial: EscalationState = {
+def initial_state(
+    model_result: ModelResult,
+    prefetched: dict | None = None,
+) -> EscalationState:
+    """ModelResult를 그래프 state로 편다. I1 payload 조립도 이 형태를 입력으로 받는다."""
+    return {
         "care_target_id": model_result.care_target_id,
         "device_id": model_result.device_id,
         "event_type": model_result.event_type.value,
@@ -437,14 +448,14 @@ async def run(model_result: ModelResult) -> EscalationState:
         "confidence": model_result.confidence,
         "risk_score": model_result.risk_score,
         "model_version": model_result.model_version,
-        "detected_at": model_result.detected_at.isoformat(),
+        "detected_at": to_iso_ms(model_result.detected_at),
         "context_features": model_result.context_features,
         "features": model_result.features,
         "language": model_result.language,
-        "sensing_event_id": None,
-        "risk_assessment_id": None,
-        "escalation_id": None,
-        "escalation_triggered": False,
+        "sensing_event_id": (prefetched or {}).get("sensing_event_id"),
+        "risk_assessment_id": (prefetched or {}).get("risk_assessment_id"),
+        "escalation_id": (prefetched or {}).get("escalation_id"),
+        "escalation_triggered": (prefetched or {}).get("escalation_triggered", False),
         "response_policy": None,
         "voice_check_executed_at": None,
         "stt_text": None,
@@ -455,4 +466,25 @@ async def run(model_result: ModelResult) -> EscalationState:
         "escalation_continued": False,
         "next_step_order": 1,
     }
-    return await graph.ainvoke(initial)
+
+
+async def run(
+    model_result: ModelResult,
+    prefetched: dict | None = None,
+) -> EscalationState:
+    """모델 결과를 받아 에스컬레이션 흐름을 실행한다.
+
+    prefetched: 호출자가 이미 I1을 보냈다면 그 응답(sensing_event_id·escalation_id 등).
+    주면 I1을 다시 보내지 않는다 — 추론 파이프라인은 I5 전송을 위해 먼저 I1을 호출한다.
+    """
+    logger.info(
+        "모델 결과 수신",
+        extra={
+            "action": "model_result_received",
+            "care_target_id": model_result.care_target_id,
+            "event_type": model_result.event_type.value,
+            "risk_level": model_result.risk_level.value,
+            "confidence": model_result.confidence,
+        },
+    )
+    return await graph.ainvoke(initial_state(model_result, prefetched))

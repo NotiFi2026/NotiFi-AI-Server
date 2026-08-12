@@ -121,3 +121,28 @@ async def save_daily_report(
             "report_date": report_date,
         },
     )
+
+
+async def send_pose_clip(
+    sensing_event_id: int,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """I5: 복원 스켈레톤 클립 적재. 이벤트당 1건 멱등 — 재요청 시 기존 id를 반환한다."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{_BASE}/sensing-events/{sensing_event_id}/pose-clip",
+            json=payload,
+            headers=_HEADERS,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    data = resp.json()["data"]
+    logger.info(
+        "포즈 클립 적재 완료",
+        extra={
+            "action": "pose_clip_saved",
+            "sensing_event_id": sensing_event_id,
+            "pose_clip_id": data.get("pose_clip_id"),
+        },
+    )
+    return data
