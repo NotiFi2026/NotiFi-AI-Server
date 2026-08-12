@@ -50,22 +50,26 @@ class FakeModel:
 
 
 class FakeProfile:
+    def __init__(self, device_id: str = "care-1") -> None:
+        self.device_id = device_id
+
+    def save(self, path):
+        path.write_bytes(b"profile")
+        return path
+
     def summary(self) -> dict:
         return {"baseline_link_valid": [True, True, True], "link_coverage": [0.9, 0.9, 0.9]}
 
 
 class FakeRegistry:
-    def __init__(self) -> None:
-        self.saved = []
+    def __init__(self, root="."):
+        self.root = root
 
     def load_calibration(self, device_id: str):
         return None
 
     def load_device(self, device_id: str):
         return {"device_id": device_id}
-
-    def save_calibration(self, profile):
-        self.saved.append(profile)
 
 
 @pytest.fixture
@@ -126,15 +130,14 @@ def make_calibration_npz() -> bytes:
     return buffer.getvalue()
 
 
-def test_calibration_uses_its_own_lock_timeout(monkeypatch):
+def test_calibration_uses_its_own_lock_timeout(monkeypatch, tmp_path):
     """캘리브레이션은 추론(3초)보다 오래 걸린다 — 같은 타임아웃을 쓰면 자기 차례를 못 잡는다."""
     monkeypatch.setattr(settings, "notifi_inference_lock_timeout_seconds", 0.1)
     monkeypatch.setattr(settings, "notifi_calibration_lock_timeout_seconds", 5.0)
 
     model = FakeModel(delay=1.0)
-    model.fit_calibration = lambda device_id, absence, support: FakeProfile()
-    registry = FakeRegistry()
-    runtime = ModelRuntime(model, registry)
+    model.fit_calibration = lambda device_id, absence, support: FakeProfile(device_id)
+    runtime = ModelRuntime(model, FakeRegistry(tmp_path))
 
     # 추론이 1초 동안 락을 잡고 있어도 캘리브레이션은 5초까지 기다려 성공한다
     blocker = threading.Thread(target=runtime.predict_npz, args=("care-1", make_npz()))
@@ -143,11 +146,11 @@ def test_calibration_uses_its_own_lock_timeout(monkeypatch):
 
     summary = runtime.fit_calibration_npz("care-1", make_calibration_npz())
     assert summary["link_coverage"] == [0.9, 0.9, 0.9]
-    assert len(registry.saved) == 1
+    assert (tmp_path / "care-1" / "calibration.pt").exists()
     blocker.join(timeout=10)
 
 
-def test_calibration_releases_lock_on_failure(monkeypatch):
+def test_calibration_releases_lock_on_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "notifi_calibration_lock_timeout_seconds", 5.0)
 
     def explode(device_id, absence, support):
@@ -155,7 +158,7 @@ def test_calibration_releases_lock_on_failure(monkeypatch):
 
     model = FakeModel()
     model.fit_calibration = explode
-    runtime = ModelRuntime(model, FakeRegistry())
+    runtime = ModelRuntime(model, FakeRegistry(tmp_path))
 
     with pytest.raises(RuntimeError):
         runtime.fit_calibration_npz("care-1", make_calibration_npz())

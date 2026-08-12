@@ -117,10 +117,19 @@ def test_ingest_allows_legacy_device_id(client):
 
 # ── 품질 경고 판정 ──────────────────────────────────────────────────────────
 
+HEALTHY = {
+    "baseline_link_valid": [True, True, True],
+    "link_coverage": [0.9, 0.8, 0.7],
+    "absence_trials": 12,
+    "support_action_counts": [2, 2, 2, 2, 2, 2, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0],
+}
+
+
 def test_warns_when_fewer_than_two_links_alive():
     from app.api.model_routes import _calibration_warnings
 
     warnings = _calibration_warnings({
+        **HEALTHY,
         "baseline_link_valid": [True, False, False],
         "link_coverage": [0.9, 0.0, 0.0],
     })
@@ -130,7 +139,81 @@ def test_warns_when_fewer_than_two_links_alive():
 def test_no_warnings_when_installation_is_healthy():
     from app.api.model_routes import _calibration_warnings
 
-    assert _calibration_warnings({
-        "baseline_link_valid": [True, True, True],
-        "link_coverage": [0.9, 0.8, 0.7],
-    }) == []
+    assert _calibration_warnings(HEALTHY) == []
+
+
+def test_warns_when_absence_trials_are_insufficient():
+    """README에 12회를 계약으로 써놓고 검증하지 않으면 계약이 아니다."""
+    from app.api.model_routes import _calibration_warnings
+
+    warnings = _calibration_warnings({**HEALTHY, "absence_trials": 3})
+    assert any("무인 트라이얼 3회" in w for w in warnings)
+
+
+def test_warns_when_basic_actions_are_missing():
+    from app.api.model_routes import _calibration_warnings
+
+    warnings = _calibration_warnings({**HEALTHY, "support_action_counts": [0] * 17})
+    assert any("기본 동작" in w for w in warnings)
+
+
+def test_absence_count_absent_is_not_warned():
+    """저장된 프로필 요약에는 트라이얼 수가 없다 — 없다고 경고하면 오탐이다."""
+    from app.api.model_routes import _calibration_warnings
+
+    summary = {k: v for k, v in HEALTHY.items() if k != "absence_trials"}
+    assert _calibration_warnings(summary) == []
+
+
+# ── 삭제 ────────────────────────────────────────────────────────────────────
+
+def test_delete_requires_key(client):
+    assert client.delete("/internal/model/devices/care-1").status_code == 401
+
+
+def test_delete_503_when_runtime_missing(client):
+    res = client.delete("/internal/model/devices/care-1", headers={"X-Internal-Key": KEY})
+    assert res.status_code == 503
+
+
+def test_delete_rejects_bad_device_id(client):
+    res = client.delete(r"/internal/model/devices/..\..\x", headers={"X-Internal-Key": KEY})
+    assert res.status_code in (400, 404)
+
+
+# ── 동시 캘리브레이션 제한 ──────────────────────────────────────────────────
+
+def test_second_concurrent_calibration_is_rejected(client):
+    """업로드·압축해제는 모델 락 밖이라 여기서 막지 않으면 메모리가 밀린다."""
+    from app.api import model_routes
+
+    class NeverCalled:
+        def fit_calibration_npz(self, *args):
+            raise AssertionError("슬롯이 찼으면 학습까지 가면 안 된다")
+
+    client.app.state.model_runtime = NeverCalled()
+    model_routes._calibration_slot.acquire()
+    try:
+        res = client.post(
+            "/internal/model/devices/care-1/calibrate",
+            headers={"X-Internal-Key": KEY},
+            files={"file": ("c.npz", b"x")},
+        )
+        assert res.status_code == 503
+        assert "another calibration" in res.json()["detail"].lower()
+    finally:
+        model_routes._calibration_slot.release()
+        client.app.state.model_runtime = None
+
+
+def test_calibration_slot_released_after_failure(client):
+    """실패해도 슬롯이 남으면 이후 모든 캘리브레이션이 503이 된다."""
+    from app.api import model_routes
+
+    client.post(
+        "/internal/model/devices/care-1/calibrate",
+        headers={"X-Internal-Key": KEY},
+        files={"file": ("c.npz", b"x")},
+    )
+    assert model_routes._calibration_slot.acquire(blocking=False)
+    model_routes._calibration_slot.release()
