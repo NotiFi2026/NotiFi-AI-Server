@@ -40,7 +40,29 @@ async def lifespan(app: FastAPI):
             )
     else:
         logger.info("모델 로드 건너뜀", extra={"action": "model_disabled"})
-    yield
+
+    # 수집 데몬은 모델이 있어야 의미가 있다 — 없으면 윈도를 떠도 판정할 수가 없다
+    app.state.stream_pump = None
+    if settings.notifi_stream_enabled and app.state.model_runtime is not None:
+        try:
+            from app.stream.pump import StreamPump
+
+            pump = StreamPump(app.state.model_runtime, settings)
+            pump.start(app.state.model_runtime.list_device_configs())
+            app.state.stream_pump = pump
+        except Exception as exc:
+            # 수집이 안 떠도 서버는 살아 있어야 한다 — HTTP ingest 경로는 그대로 쓸 수 있다
+            logger.error(
+                "수집 데몬 기동 실패 — 수집 없이 기동한다",
+                extra={"action": "stream_start_failed", "error": str(exc)},
+                exc_info=True,
+            )
+
+    try:
+        yield
+    finally:
+        if app.state.stream_pump is not None:
+            await app.state.stream_pump.stop()
 
 
 app = FastAPI(title="Notifi AI Server", lifespan=lifespan)

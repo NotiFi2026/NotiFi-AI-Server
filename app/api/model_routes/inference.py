@@ -18,16 +18,12 @@ from fastapi import (
     Request,
 )
 
-from app.agent import escalation_agent
-from app.agent.payload_builder import build_sensing_event_payload
-from app.agent.schemas import EventType, RiskLevel
 from app.api.auth import check_internal_key
 from app.api.model_routes._common import get_runtime, guard_inference, run_inference
 from app.api.routes import run_agent_safely
-from app.clients import spring_client
 from app.common.logging_config import logger
 from app.config import settings
-from app.model import pipeline
+from app.model import ingest_service, pipeline
 from app.model.errors import ModelContractError
 
 router = APIRouter()
@@ -142,64 +138,28 @@ async def ingest(
         get_runtime(request), device_id, file, True, "model_ingest"
     )
 
-    detected_at = window_end_at or datetime.now(timezone.utc)
     try:
-        model_result = pipeline.to_model_result(pred, care_target_id, spring_device_id, detected_at)
+        return await ingest_service.deliver(
+            pred,
+            device_id=device_id,
+            care_target_id=care_target_id,
+            spring_device_id=spring_device_id,
+            detected_at=window_end_at or datetime.now(timezone.utc),
+            schedule_danger=lambda result, saved: background_tasks.add_task(
+                run_agent_safely, result, saved
+            ),
+        )
     except ModelContractError as exc:
         logger.error(
             "모델 계약 위반",
             extra={"action": "model_contract_error", "device_id": device_id, "error": str(exc)},
         )
         raise HTTPException(status_code=500, detail="Unexpected model output") from exc
-
-    activity_class = model_result.activity_class
-
-    if not pipeline.should_send(device_id, model_result.event_type, activity_class, detected_at):
-        logger.info(
-            "NORMAL 절감 — 전송 생략",
-            extra={
-                "action": "model_ingest_throttled",
-                "device_id": device_id,
-                "activity_class": activity_class,
-            },
-        )
-        return {"sent": False, "reason": "normal_throttled", "activity_class": activity_class}
-
-    try:
-        saved = await spring_client.send_sensing_event(
-            build_sensing_event_payload(escalation_agent.initial_state(model_result))
-        )
-        pose_clip_id = None
-        if model_result.event_type is not EventType.NORMAL and saved.get("sensing_event_id"):
-            clip = await spring_client.send_pose_clip(
-                saved["sensing_event_id"],
-                pipeline.build_pose_clip_payload(
-                    pred, pipeline.window_start(detected_at, pred), detected_at
-                ),
-            )
-            pose_clip_id = clip.get("pose_clip_id")
     except httpx.HTTPError as exc:
-        # Spring 장애를 삼키면 호출자가 재시도하지 못한다.
-        # 여기서 빠져나가면 mark_sent를 하지 않으므로 다음 윈도가 절감으로 막히지 않는다.
+        # Spring 장애를 삼키면 호출자가 재시도하지 못한다
         logger.error(
             "Spring 적재 실패",
             extra={"action": "spring_ingest_failed", "device_id": device_id, "error": str(exc)},
             exc_info=True,
         )
         raise HTTPException(status_code=502, detail="Spring ingest failed") from exc
-
-    pipeline.mark_sent(device_id, activity_class, detected_at)
-
-    if model_result.risk_level is RiskLevel.DANGER:
-        background_tasks.add_task(run_agent_safely, model_result, saved)
-
-    return {
-        "sent": True,
-        "sensing_event_id": saved.get("sensing_event_id"),
-        "event_type": model_result.event_type.value,
-        "activity_class": activity_class,
-        "risk_level": model_result.risk_level.value,
-        "risk_score": model_result.risk_score,
-        "escalation_triggered": saved.get("escalation_triggered", False),
-        "pose_clip_id": pose_clip_id,
-    }

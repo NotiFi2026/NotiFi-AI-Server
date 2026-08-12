@@ -5,10 +5,11 @@
 """
 from fastapi import APIRouter
 
-from app.api.model_routes import devices, inference
+from app.api.model_routes import calibration_live, devices, inference
 
 router = APIRouter(prefix="/internal/model")
 router.include_router(devices.router)
+router.include_router(calibration_live.router)
 router.include_router(inference.router)
 
 __all__ = ["router"]

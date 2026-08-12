@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from app.api.auth import check_internal_key
-from app.api.model_routes._common import get_runtime, require_device_id
+from app.api.model_routes._common import get_runtime, refresh_stream_mapping, require_device_id
 from app.common.logging_config import logger
 from app.config import settings
 from app.model import pipeline
@@ -48,7 +48,7 @@ class DeviceRegisterRequest(BaseModel):
     notes: str = ""
 
 
-def _calibration_warnings(summary: dict[str, Any]) -> list[str]:
+def calibration_warnings(summary: dict[str, Any]) -> list[str]:
     """설치 품질·수집 규모 경고. 거부하지 않고 알린다 — 재시도로 덮어쓸 수 있다."""
     warnings: list[str] = []
     valid_links = sum(1 for ok in summary.get("baseline_link_valid", []) if ok)
@@ -104,6 +104,7 @@ async def register_device(
         # 보드 ID 중복·공백 등 — 계약 위반 내용은 그대로 알려줘야 고칠 수 있다
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    refresh_stream_mapping(request, runtime)
     return {"care_target_id": body.care_target_id, **result}
 
 
@@ -119,6 +120,7 @@ async def delete_device(
     runtime = get_runtime(request)
     if not await run_in_threadpool(runtime.delete_device, device_id):
         raise HTTPException(status_code=404, detail="Device not found")
+    refresh_stream_mapping(request, runtime, dropped=device_id)
     return {"device_id": device_id, "deleted": True}
 
 
@@ -134,7 +136,7 @@ async def device_status(
     runtime = get_runtime(request)
     status = await run_in_threadpool(runtime.device_status, device_id)
     if status.get("calibration"):
-        status["warnings"] = _calibration_warnings(status["calibration"])
+        status["warnings"] = calibration_warnings(status["calibration"])
         status["usable"] = not status["warnings"]
     return status
 
@@ -189,5 +191,5 @@ async def calibrate(
     finally:
         _calibration_slot.release()
 
-    warnings = _calibration_warnings(summary)
+    warnings = calibration_warnings(summary)
     return {"device_id": device_id, "usable": not warnings, "warnings": warnings, **summary}

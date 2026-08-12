@@ -18,7 +18,7 @@ from notifi_ai.constants import ACTION_TO_RISK, JOINT_NAMES, MAX_FRAMES
 from notifi_ai.csi_parser import default_grid, packets_to_grid, parse_csi_line
 from notifi_ai.io import load_calibration_npz, load_query_npz
 from notifi_ai.registry import DeviceRegistry
-from notifi_ai.schemas import DeviceConfig
+from notifi_ai.schemas import DeviceConfig, SupportTrial
 
 from app.model.spec import ModelSpec
 
@@ -26,6 +26,7 @@ __all__ = [
     "DeviceConfig",
     "DeviceRegistry",
     "ModelSpec",
+    "SupportTrial",
     "build_spec",
     "load_calibration_npz",
     "load_model",

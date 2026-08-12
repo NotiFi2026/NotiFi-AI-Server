@@ -43,5 +43,21 @@ class Settings(BaseSettings):
     # 추론 대기(3초)와 같은 값을 쓰면 캘리브레이션이 자기 차례를 못 잡는다.
     notifi_calibration_lock_timeout_seconds: float = 120.0
 
+    # ── CSI 실시간 수집 데몬 ────────────────────────────────────────────────
+    # 기본은 꺼 둔다. 보드가 없는 개발 환경에서 켜지면 시리얼 열기 실패 로그만 쌓인다
+    notifi_stream_enabled: bool = False
+    # serial(RX 보드 USB) 또는 replay(수집 CSV 재생 — 하드웨어 없이 검증)
+    notifi_stream_source: str = "serial"
+    notifi_stream_port: str = "COM7"
+    notifi_stream_baud: int = 921600
+    # 윈도를 뜨는 주기. 짧을수록 감지가 빠르지만 추론 부하가 는다(윈도 자체는 10.13초)
+    notifi_stream_stride_seconds: float = 2.0
+    # 위험 판정 재신고 억제. Spring은 DANGER마다 에스컬레이션을 새로 만들므로,
+    # 이게 없으면 한 번 넘어졌는데 겹치는 윈도 수만큼 119 신고가 걸린다
+    notifi_stream_cooldown_seconds: float = 120.0
+    notifi_stream_replay_path: str = ""
+    notifi_stream_replay_speed: float = 1.0
+    notifi_stream_replay_loop: bool = False
+
 
 settings = Settings()

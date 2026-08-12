@@ -37,6 +37,28 @@ def require_device_id(device_id: str) -> None:
         raise HTTPException(status_code=400, detail="Invalid device_id")
 
 
+def get_pump(request: Request) -> Any:
+    """수집 데몬. 꺼져 있으면 라이브 캡처 계열 엔드포인트는 성립하지 않는다."""
+    pump = getattr(request.app.state, "stream_pump", None)
+    if pump is None:
+        raise HTTPException(status_code=503, detail="CSI stream is not running")
+    return pump
+
+
+def refresh_stream_mapping(request: Request, runtime: "ModelRuntime", dropped: str | None = None) -> None:
+    """등록·삭제 후 수집 데몬의 보드 매핑을 갱신한다.
+
+    안 하면 방금 등록한 보드의 패킷이 "등록되지 않은 보드"로 계속 버려진다 —
+    설치 현장에서 원인 찾기 제일 어려운 종류의 침묵이다.
+    """
+    pump = getattr(request.app.state, "stream_pump", None)
+    if pump is None:
+        return
+    if dropped is not None:
+        pump.buffers.drop(dropped)
+    pump.router.reload(runtime.list_device_configs())
+
+
 def guard_inference(x_internal_key: str, device_id: str, file: bytes) -> None:
     """두 추론 엔드포인트가 공유하는 입력 가드 — 한쪽만 고치는 사고를 막는다."""
     check_internal_key(x_internal_key)

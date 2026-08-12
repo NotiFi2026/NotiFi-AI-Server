@@ -70,6 +70,27 @@ class ModelRuntime:
     def list_devices(self) -> list[str]:
         return self._registry.list_devices()
 
+    def list_device_configs(self) -> list[Any]:
+        """등록된 디바이스 설정 전체. 수집 데몬이 보드 MAC → 링크 매핑을 만드는 데 쓴다.
+
+        레지스트리에 파일만 있고 읽을 수 없는 항목은 건너뛴다 — 한 가구의 손상된 파일이
+        나머지 가구의 수집까지 막으면 안 된다.
+        """
+        configs = []
+        for device_id in self._registry.list_devices():
+            try:
+                configs.append(self._registry.load_device(device_id))
+            except Exception as exc:  # noqa: BLE001 - 손상 파일 하나로 전체가 죽지 않게
+                logger.warning(
+                    "디바이스 설정 로드 실패 — 건너뜀",
+                    extra={
+                        "action": "device_config_unreadable",
+                        "device_id": device_id,
+                        "error": str(exc),
+                    },
+                )
+        return configs
+
     def inflight_seconds(self) -> float | None:
         """진행 중인 추론의 경과 시간. 유휴면 None.
 
@@ -182,8 +203,21 @@ class ModelRuntime:
         추론보다 훨씬 오래 걸리므로 전용 락 타임아웃을 쓴다 — 추론 대기(3초)로는
         자기 차례를 못 잡는다.
         """
-        self._registry.load_device(device_id)  # 등록 선행 확인
         absence, support = load_calibration_npz(payload)
+        return self.fit_calibration_arrays(device_id, absence, support)
+
+    def fit_calibration_arrays(
+        self,
+        device_id: str,
+        absence: list[Any],
+        support: list[Any],
+    ) -> dict[str, Any]:
+        """이미 배열로 들고 있는 트라이얼로 프로필을 학습·저장한다.
+
+        수집 데몬은 라이브 버퍼에서 바로 윈도를 뜨므로 NPZ 왕복이 필요 없다.
+        NPZ 경로도 여기로 들어와 **락·저장·요약이 한 곳에서만 일어난다.**
+        """
+        self._registry.load_device(device_id)  # 등록 선행 확인
 
         # 학습과 저장을 한 임계구역에 둔다 — 동시 캘리브레이션 시 fit 결과와
         # 디스크 내용이 어긋나는 것을 막는다.
@@ -250,8 +284,22 @@ class ModelRuntime:
 
         무보정 추론은 허용하지 않는다 — 확정된 연동 계약.
         """
-        profile = self._registry.load_calibration(device_id)
         csi, link_mask = load_query_npz(payload)
+        return self.predict_arrays(device_id, csi, link_mask, include_pose)
+
+    def predict_arrays(
+        self,
+        device_id: str,
+        csi: Any,
+        link_mask: Any,
+        include_pose: bool = False,
+    ) -> dict[str, Any]:
+        """이미 배열로 들고 있는 윈도를 추론한다.
+
+        수집 데몬은 버퍼에서 바로 배열을 만들므로 NPZ로 직렬화했다가 다시 푸는 왕복이 불필요하다.
+        NPZ 경로(predict_npz)도 결국 여기로 들어와 **락·로깅·라벨링이 한 곳에서만 일어난다.**
+        """
+        profile = self._registry.load_calibration(device_id)
 
         with self._exclusive(settings.notifi_inference_lock_timeout_seconds, device_id):
             prediction = self._model.predict(csi, link_mask, profile)
