@@ -7,9 +7,12 @@ notifi_ai 패키지의 create_app(api.py)이 하던 구성(모델 + 레지스트
 """
 from __future__ import annotations
 
+import os
+import shutil
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterator
 
 from notifi_ai import NotiFiAIv1
@@ -95,30 +98,92 @@ class ModelRuntime:
             self._inflight_since = None
             self._lock.release()
 
-    def register_device(self, config: dict[str, Any]) -> str:
-        """디바이스를 레지스트리에 등록한다. 저장 경로는 반환하지 않는다(내부 경로 비노출)."""
+    _BOARD_FIELDS = ("rx_id", "tx1_id", "tx2_id", "tx3_id")
+
+    def _device_dir(self, device_id: str) -> Path:
+        return Path(self._registry.root) / device_id
+
+    def register_device(self, config: dict[str, Any]) -> dict[str, Any]:
+        """디바이스를 레지스트리에 등록한다. 저장 경로는 반환하지 않는다(내부 경로 비노출).
+
+        보드 구성이 바뀐 재등록이면 기존 캘리브레이션을 폐기한다 — 이전 하드웨어용
+        baseline으로 추론을 계속하면 낙상 판정이 조용히 틀어진다(모델 문서 §3.5:
+        보드 이동·안테나 회전 후 재캘리브레이션 필수).
+        """
         device_config = DeviceConfig(**config)
+        device_id = device_config.device_id
+
+        invalidated = False
+        try:
+            previous = self._registry.load_device(device_id)
+        except FileNotFoundError:
+            previous = None
+        if previous is not None:
+            changed = any(
+                getattr(previous, field) != getattr(device_config, field)
+                for field in self._BOARD_FIELDS
+            )
+            if changed:
+                invalidated = self._discard_calibration(device_id)
+
         self._registry.register(device_config)
         logger.info(
             "디바이스 등록",
-            extra={"action": "device_registered", "device_id": device_config.device_id},
+            extra={
+                "action": "device_registered",
+                "device_id": device_id,
+                "calibration_invalidated": invalidated,
+            },
         )
-        return device_config.device_id
+        return {"device_id": device_id, "calibration_invalidated": invalidated}
 
-    def fit_calibration_npz(self, device_id: str, payload: bytes) -> dict[str, Any]:
+    def _discard_calibration(self, device_id: str) -> bool:
+        """보드가 바뀌었으니 프로필을 버린다. 재캘리브레이션 전까지 추론은 400이 된다."""
+        path = self._device_dir(device_id) / "calibration.pt"
+        if not path.exists():
+            return False
+        path.unlink()
+        logger.warning(
+            "보드 구성 변경 — 캘리브레이션 폐기",
+            extra={"action": "calibration_invalidated", "device_id": device_id},
+        )
+        return True
+
+    def delete_device(self, device_id: str) -> bool:
+        """등록·프로필을 함께 제거한다. 없으면 False.
+
+        노인이 Spring에서 삭제돼도 여기 CSI 파생 상태(baseline·bias)가 남지 않게 한다.
+        """
+        folder = self._device_dir(device_id)
+        root = Path(self._registry.root).resolve()
+        resolved = folder.resolve()
+        # device_id는 라우터에서 정규식으로 걸리지만, 경로 삭제는 한 겹 더 확인한다
+        if root not in resolved.parents or not resolved.is_dir():
+            return False
+        shutil.rmtree(resolved)
+        logger.info("디바이스 삭제", extra={"action": "device_deleted", "device_id": device_id})
+        return True
+
+    def fit_calibration_npz(self, device_id: str, payload: Any) -> dict[str, Any]:
         """캘리브레이션 NPZ로 프로필을 학습·저장하고 요약을 반환한다.
 
-        등록되지 않은 디바이스면 FileNotFoundError. 추론보다 훨씬 오래 걸리므로
-        전용 락 타임아웃을 쓴다 — 추론 대기(3초)로는 자기 차례를 못 잡는다.
+        payload는 bytes 또는 파일 객체. 등록되지 않은 디바이스면 FileNotFoundError.
+        추론보다 훨씬 오래 걸리므로 전용 락 타임아웃을 쓴다 — 추론 대기(3초)로는
+        자기 차례를 못 잡는다.
         """
         self._registry.load_device(device_id)  # 등록 선행 확인
         absence, support = load_calibration_npz(payload)
 
+        # 학습과 저장을 한 임계구역에 둔다 — 동시 캘리브레이션 시 fit 결과와
+        # 디스크 내용이 어긋나는 것을 막는다.
         with self._exclusive(settings.notifi_calibration_lock_timeout_seconds, device_id):
             profile = self._model.fit_calibration(device_id, absence, support)
-        self._registry.save_calibration(profile)
+            self._save_calibration_atomic(profile)
 
         summary = profile.summary()
+        summary["absence_trials"] = len(absence)
+        summary["support_trials"] = len(support)
+        summary["support_action_ids"] = [int(trial.action_id) for trial in support]
         logger.info(
             "캘리브레이션 완료",
             extra={
@@ -130,6 +195,22 @@ class ModelRuntime:
             },
         )
         return summary
+
+    def _save_calibration_atomic(self, profile: Any) -> None:
+        """임시 파일에 쓰고 교체한다.
+
+        대상 경로에 바로 쓰면 저장 중 중단 시 프로필이 깨지고, 그 가구는
+        재캘리브레이션 전까지 모든 추론이 400이 된다.
+        """
+        folder = self._device_dir(profile.device_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "calibration.pt"
+        tmp = folder / "calibration.pt.tmp"
+        try:
+            profile.save(tmp)
+            os.replace(tmp, target)  # 같은 볼륨이라 원자적
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def device_status(self, device_id: str) -> dict[str, Any]:
         """등록·캘리브레이션 여부. 위저드가 어디까지 진행됐는지 판단하는 근거."""
