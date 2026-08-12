@@ -10,10 +10,16 @@ from app.common.logging_config import logger
 router = APIRouter(prefix="/internal/agent")
 
 
-async def _run_safe(model_result: ModelResult) -> None:
-    """백그라운드 실행 래퍼 — 예외를 로그로 흡수."""
+async def run_agent_safely(
+    model_result: ModelResult,
+    prefetched: dict | None = None,
+) -> None:
+    """백그라운드 실행 래퍼 — 예외를 로그로 흡수.
+
+    prefetched: 호출자가 이미 I1을 보냈다면 그 응답(추론 파이프라인 경로).
+    """
     try:
-        await escalation_agent.run(model_result)
+        await escalation_agent.run(model_result, prefetched=prefetched)
     except Exception as exc:
         logger.error(
             "에스컬레이션 실행 오류",
@@ -40,7 +46,7 @@ async def run_agent(
     check_internal_key(x_internal_key)
 
     update_risk_level(model_result.risk_level.value)
-    background_tasks.add_task(_run_safe, model_result)
+    background_tasks.add_task(run_agent_safely, model_result)
 
     logger.info(
         "에스컬레이션 요청 수신",

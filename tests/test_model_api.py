@@ -80,6 +80,112 @@ def test_predict_503_when_runtime_missing(client):
     assert res.status_code == 503
 
 
+class StuckRuntime:
+    """추론이 멈춘 런타임 흉내 — 모델 없이 health 판정만 검증한다."""
+
+    def __init__(self, inflight: float) -> None:
+        self._inflight = inflight
+
+    def inflight_seconds(self):
+        return self._inflight
+
+    def last_success_age_seconds(self):
+        return None
+
+    def describe(self):
+        raise AssertionError("멈춤이면 describe까지 가지 않아야 한다")
+
+
+def test_health_503_when_inference_stuck(client, monkeypatch):
+    """멈춘 CUDA 연산은 되돌릴 수 없다 — 재시작을 유도할 유일한 신호가 이 503이다."""
+    monkeypatch.setattr(settings, "notifi_inference_stuck_seconds", 60.0)
+    client.app.state.model_runtime = StuckRuntime(inflight=120.0)
+    try:
+        assert client.get("/internal/model/health").status_code == 503
+    finally:
+        client.app.state.model_runtime = None
+
+
+def test_health_ok_while_inference_is_merely_running(client, monkeypatch):
+    """진행 중이라고 아프다고 하면 안 된다 — 한도를 넘겨야 멈춤이다."""
+    monkeypatch.setattr(settings, "notifi_inference_stuck_seconds", 60.0)
+
+    class Running(StuckRuntime):
+        def describe(self):
+            return {
+                "model_name": "NotiFi_AI_v1", "device": "cpu",
+                "actions": [], "risks": [], "artifact_dir": "/x", "metadata": {},
+            }
+
+    client.app.state.model_runtime = Running(inflight=1.0)
+    try:
+        assert client.get("/internal/model/health").status_code == 200
+    finally:
+        client.app.state.model_runtime = None
+
+
+def test_ingest_rejects_wrong_key(client):
+    res = client.post(
+        "/internal/model/devices/home-001/ingest",
+        headers={"X-Internal-Key": "wrong"},
+        files={"file": ("q.npz", b"x")},
+        data={"care_target_id": "1"},
+    )
+    assert res.status_code == 401
+
+
+def test_ingest_requires_care_target_id(client):
+    res = client.post(
+        "/internal/model/devices/home-001/ingest",
+        headers={"X-Internal-Key": KEY},
+        files={"file": ("q.npz", b"x")},
+    )
+    assert res.status_code == 422
+
+
+def test_ingest_rejects_bad_device_id(client):
+    res = client.post(
+        r"/internal/model/devices/..\..\x/ingest",
+        headers={"X-Internal-Key": KEY},
+        files={"file": ("q.npz", b"x")},
+        data={"care_target_id": "1"},
+    )
+    assert res.status_code in (400, 404)
+
+
+def test_ingest_503_when_runtime_missing(client):
+    res = client.post(
+        "/internal/model/devices/home-001/ingest",
+        headers={"X-Internal-Key": KEY},
+        files={"file": ("q.npz", b"x")},
+        data={"care_target_id": "1"},
+    )
+    assert res.status_code == 503
+
+
+def test_agent_run_rejects_naive_detected_at(client):
+    """오프셋 없는 시각은 파싱 단계에서 거부해야 한다.
+
+    통과시키면 202를 반환한 뒤 백그라운드에서 예외가 삼켜져
+    낙상 이벤트가 "접수됨"으로 응답되고 실제로는 사라진다.
+    """
+    res = client.post(
+        "/internal/agent/run",
+        headers={"X-Internal-Key": KEY},
+        json={
+            "care_target_id": 1,
+            "event_type": "FALL",
+            "label": "fall_from_standing",
+            "risk_level": "danger",
+            "confidence": 0.9,
+            "risk_score": 90,
+            "model_version": "NotiFi_AI_v1",
+            "detected_at": "2026-08-12T03:22:00",
+        },
+    )
+    assert res.status_code == 422
+
+
 def test_agent_run_rejects_wrong_key(client):
     """기존 엔드포인트도 같은 인증 헬퍼를 쓴다.
 
