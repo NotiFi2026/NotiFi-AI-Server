@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
     app.state.model_runtime = None
     if settings.notifi_model_enabled:
         try:
-            from app.model import ModelRuntime
+            from app.model.runtime import ModelRuntime
 
             app.state.model_runtime = ModelRuntime.load(settings)
             logger.info(

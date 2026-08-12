@@ -11,6 +11,7 @@ import threading
 from typing import Any
 
 from notifi_ai import NotiFiAIv1
+from notifi_ai.constants import ACTION_TO_RISK, JOINT_NAMES, TARGET_FPS
 from notifi_ai.io import load_query_npz
 from notifi_ai.registry import DeviceRegistry
 
@@ -67,4 +68,12 @@ class ModelRuntime:
                 "low_quality": prediction.quality.get("low_quality"),
             },
         )
-        return prediction.to_dict(include_pose=include_pose)
+        result = prediction.to_dict(include_pose=include_pose)
+        # 변환 계층이 notifi_ai에 의존하지 않도록 필요한 상수를 여기서 실어 보낸다.
+        # action_risk_id는 행동의 정적 카테고리(0 safe/1 warning/2 danger)로,
+        # 독립 위험도 헤드(risk_label)와 다르다 — event_type 매핑에 쓴다.
+        result["action_risk_id"] = ACTION_TO_RISK[prediction.action_id]
+        if include_pose:
+            result["joints"] = list(JOINT_NAMES)
+            result["fps"] = TARGET_FPS
+        return result

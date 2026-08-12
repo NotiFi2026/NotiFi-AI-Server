@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     notifi_artifact_dir: str | None = None
     # 패키지 기본값 "runtime/devices"는 cwd 의존이라 절대 경로로 고정한다
     notifi_registry_root: str = str(_REPO_ROOT / "runtime" / "devices")
+    # 같은 행동이 이어질 때 NORMAL 이벤트를 다시 보내기까지의 간격
+    notifi_normal_interval_seconds: int = 300
 
 
 settings = Settings()
