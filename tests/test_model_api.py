@@ -80,6 +80,45 @@ def test_predict_503_when_runtime_missing(client):
     assert res.status_code == 503
 
 
+def test_ingest_rejects_wrong_key(client):
+    res = client.post(
+        "/internal/model/devices/home-001/ingest",
+        headers={"X-Internal-Key": "wrong"},
+        files={"file": ("q.npz", b"x")},
+        data={"care_target_id": "1"},
+    )
+    assert res.status_code == 401
+
+
+def test_ingest_requires_care_target_id(client):
+    res = client.post(
+        "/internal/model/devices/home-001/ingest",
+        headers={"X-Internal-Key": KEY},
+        files={"file": ("q.npz", b"x")},
+    )
+    assert res.status_code == 422
+
+
+def test_ingest_rejects_bad_device_id(client):
+    res = client.post(
+        r"/internal/model/devices/..\..\x/ingest",
+        headers={"X-Internal-Key": KEY},
+        files={"file": ("q.npz", b"x")},
+        data={"care_target_id": "1"},
+    )
+    assert res.status_code in (400, 404)
+
+
+def test_ingest_503_when_runtime_missing(client):
+    res = client.post(
+        "/internal/model/devices/home-001/ingest",
+        headers={"X-Internal-Key": KEY},
+        files={"file": ("q.npz", b"x")},
+        data={"care_target_id": "1"},
+    )
+    assert res.status_code == 503
+
+
 def test_agent_run_rejects_wrong_key(client):
     """기존 엔드포인트도 같은 인증 헬퍼를 쓴다.
 

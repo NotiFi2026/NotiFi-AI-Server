@@ -41,11 +41,31 @@ py -3.11 -m venv .venv
 |---|---|---|---|
 | POST | `/internal/agent/run` | `X-Internal-Key` | `ModelResult` 수신 → 백그라운드로 에스컬레이션 실행, 202 |
 | GET | `/internal/model/health` | 선택 | 모델 로드 상태(17행동·3위험도). 키를 주면 설치 경로·성능지표·등록 디바이스까지 |
-| POST | `/internal/model/devices/{device_id}/predict` | `X-Internal-Key` | 쿼리 NPZ 추론. `?include_pose=true`면 SMPL-22 좌표 포함 |
+| POST | `/internal/model/devices/{device_id}/predict` | `X-Internal-Key` | 쿼리 NPZ 추론만 하고 결과를 돌려준다(순수 프로브). `?include_pose=true`면 SMPL-22 좌표 포함 |
+| POST | `/internal/model/devices/{device_id}/ingest` | `X-Internal-Key` | **추론 → Spring 적재 → 에스컬레이션** 전체 파이프라인, 202 |
 | GET | `/status` | 없음 | 앱 폴링용 현재 위험도 (데모) |
 | POST | `/status/demo` | 없음 | 위험도 수동 변경 (데모 전용) |
 
 쿼리 NPZ는 `csi [T≤304, 3, 114, 2] float32` + `link_mask [T, 3] bool`. 30Hz 기준 304프레임 ≈ 10.13초 윈도다. 업로드 상한 8MB, `device_id`는 `[A-Za-z0-9_-]{1,64}`만 허용한다(레지스트리 경로 세그먼트로 쓰이므로).
+
+### ingest 파이프라인
+
+`ingest`는 CSI 윈도 하나를 받아 보호자 알림까지 이어지는 경로 전체를 담당한다.
+
+```
+NPZ → 추론 → ModelResult 변환 → (NORMAL 절감 판단) → I1 적재
+                                                    → 비정상이면 I5 클립
+                                                    → danger면 에스컬레이션(백그라운드)
+```
+
+폼 필드: `file`(NPZ), `care_target_id`(필수), `spring_device_id`(선택), `window_end_at`(선택, 기본 now).
+
+- **`care_target_id`를 호출자가 준다** — 모델 레지스트리의 문자열 `device_id`와 Spring의 노인 ID를 잇는 수단이 아직 없다(세션 5에서 정식화).
+- **`window_end_at`도 호출자가 준다** — 모델은 시각을 모른다. 윈도 시작은 `프레임수/fps`로 역산한다.
+- **NORMAL 절감**: 10초 윈도를 상시 추론하면 NORMAL이 폭증하므로, 행동이 바뀌면 즉시 보내고 같은 행동이 이어지면 `NOTIFI_NORMAL_INTERVAL_SECONDS`(기본 300초)에 1건만 보낸다. 비정상 이벤트는 절대 거르지 않는다. 상태는 **인메모리**라 재시작하면 초기화된다(NORMAL 1건을 더 보내는 정도의 영향).
+- **저품질 강등**: `quality.low_quality`면 danger 판정이라도 WARNING으로 낮추고 원 판정을 `features`에 남긴다 — 링크 부족만으로 자동 경보를 울리지 않는다.
+- **I5는 I1보다 먼저 기다리지 않는다**: danger 흐름은 음성확인·대기로 수 분이 걸리므로, 파이프라인이 I1·I5를 **동기로 먼저** 끝내고 에이전트에는 받은 ID를 넘겨 재전송을 막는다. 보호자가 알림을 받는 시점에 리플레이가 이미 있다.
+- Spring 적재 실패는 삼키지 않고 **502**로 올린다 — 호출자가 재시도해야 한다.
 
 `SPRING_INTERNAL_KEY`를 설정하지 않으면 내부 API는 **모든 요청을 401로 거부한다.** 빈 키를 유효한 키로 취급하면 헤더 없는 요청이 통과해 전부 무인증으로 열리기 때문이다.
 
