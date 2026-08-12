@@ -18,6 +18,7 @@ from app.clients import spring_client
 from app.common.logging_config import logger
 from app.config import settings
 from app.model import pipeline
+from app.model.errors import InferenceBusyError
 
 if TYPE_CHECKING:
     # 런타임에 import하면 torch·notifi_ai가 기동 시 무조건 로드된다.
@@ -45,12 +46,24 @@ async def model_health(request: Request, x_internal_key: str = Header(default=""
     """모델 로드 상태를 반환한다. 인증 없이 호출 가능하되 최소 정보만 노출한다.
 
     enabled인데 로드되지 않았으면 503 — 모니터링이 "모델 없는 서버"를 정상으로 보면 안 된다.
+    추론이 멈춘 경우에도 503 — 멈춘 CUDA 연산은 되돌릴 수 없으므로 재시작이 유일한 대응이고,
+    이 신호가 없으면 서버가 사실상 죽은 채로 200을 반환한다.
     """
     runtime = getattr(request.app.state, "model_runtime", None)
     if runtime is None:
         if settings.notifi_model_enabled:
             raise HTTPException(status_code=503, detail="Model failed to load")
         return {"loaded": False, "enabled": False}
+
+    inflight = runtime.inflight_seconds()
+    if inflight is not None and inflight > settings.notifi_inference_stuck_seconds:
+        logger.error(
+            "추론 멈춤 감지",
+            extra={"action": "inference_stuck", "inflight_seconds": inflight},
+        )
+        raise HTTPException(
+            status_code=503, detail=f"Inference stuck for {inflight:.0f}s"
+        )
 
     described = runtime.describe()
     body = {
@@ -66,6 +79,8 @@ async def model_health(request: Request, x_internal_key: str = Header(default=""
         body["artifact_dir"] = described["artifact_dir"]
         body["metadata"] = described["metadata"]
         body["devices"] = runtime.list_devices()
+        body["inflight_seconds"] = inflight
+        body["last_success_age_seconds"] = runtime.last_success_age_seconds()
     return body
 
 
@@ -92,6 +107,8 @@ async def predict(
         return await run_in_threadpool(
             runtime.predict_npz, device_id, file, include_pose
         )
+    except InferenceBusyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (FileNotFoundError, KeyError, ValueError) as exc:
         # 입력 계열만 400. RuntimeError(CUDA OOM 등)는 서버 장애이므로 500으로 올린다
         logger.warning(
@@ -133,6 +150,9 @@ async def ingest(
     runtime = _runtime(request)
     try:
         pred = await run_in_threadpool(runtime.predict_npz, device_id, file, True)
+    except InferenceBusyError as exc:
+        # 502(Spring 장애)와 구분한다 — 이건 이 서버가 바쁜 것이고, 호출자는 윈도를 버리면 된다
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (FileNotFoundError, KeyError, ValueError) as exc:
         logger.warning(
             "인제스트 입력 오류",

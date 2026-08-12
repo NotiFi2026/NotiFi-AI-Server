@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     notifi_registry_root: str = str(_REPO_ROOT / "runtime" / "devices")
     # 같은 행동이 이어질 때 NORMAL 이벤트를 다시 보내기까지의 간격
     notifi_normal_interval_seconds: int = 300
+    # 추론은 워밍업 후 ~0.21초. 몇 초를 기다린다는 건 이미 이상 신호이므로 포기하고 503을 준다
+    notifi_inference_lock_timeout_seconds: float = 3.0
+    # 한 추론이 이보다 오래 진행 중이면 멈춘 것으로 보고 health가 503을 반환한다
+    notifi_inference_stuck_seconds: float = 60.0
 
 
 settings = Settings()
