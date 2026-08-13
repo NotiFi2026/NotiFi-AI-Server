@@ -157,8 +157,10 @@ async def save_daily_report(
             "action": "spring_i3_completed",
             "care_target_id": care_target_id,
             "report_date": report_date,
-            # 신규 생성일 때만 보호자 푸시가 나간다 — 재적재는 갱신(200)
-            "created": resp.status_code == 201,
+            # 신규 생성일 때만 보호자 푸시가 나간다 — 재적재는 갱신(200).
+            # 키 이름에 `created`를 쓰면 안 된다. LogRecord의 예약 속성이라
+            # extra로 덮는 순간 KeyError로 로깅이 터진다(적재는 이미 끝난 뒤라 더 헷갈린다).
+            "newly_created": resp.status_code == 201,
         },
     )
 
