@@ -1,8 +1,10 @@
 """일일 리포트 생성 — I6 조회 → LLM → I3 적재. OpenAI·Spring·모델 없이 돈다."""
 from datetime import date, datetime, timezone
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from openai import APIError
 
 from app.agent import report_service
 from app.agent.schemas import (
@@ -208,6 +210,73 @@ def test_endpoint_returns_generated_sections(client, wired):
     # 데모에서 눌러 생성 문장을 바로 확인하는 것이 이 엔드포인트의 목적이다
     assert body["sections"][0]["title"] == "낙상이 감지됐어요"
     assert body["sections"][0]["risk_level"] == "danger"
+
+
+def raise_from_service(monkeypatch, exc: Exception):
+    async def boom(care_target_id, report_date):
+        raise exc
+
+    monkeypatch.setattr(report_service, "run_daily_report", boom)
+
+
+def spring_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "http://spring/internal/v1/care-targets/18/daily-metrics")
+    return httpx.HTTPStatusError(
+        "boom", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+def test_endpoint_maps_unknown_care_target_to_404(client, monkeypatch):
+    """500으로 흘리면 ID 오타인지 서버가 죽은 건지 구분이 안 된다."""
+    raise_from_service(monkeypatch, spring_error(404))
+
+    res = client.post(
+        "/internal/agent/reports/run",
+        json={"care_target_id": 99999},
+        headers={"X-Internal-Key": KEY},
+    )
+
+    assert res.status_code == 404
+    assert "99999" in res.json()["detail"]
+
+
+def test_endpoint_maps_internal_key_mismatch_to_actionable_502(client, monkeypatch):
+    """설정 한 줄 문제이므로 무엇을 고쳐야 하는지 응답에 담는다."""
+    raise_from_service(monkeypatch, spring_error(401))
+
+    res = client.post(
+        "/internal/agent/reports/run",
+        json={"care_target_id": 18},
+        headers={"X-Internal-Key": KEY},
+    )
+
+    assert res.status_code == 502
+    assert "INTERNAL_API_KEY" in res.json()["detail"]
+
+
+def test_endpoint_maps_spring_unreachable_to_502(client, monkeypatch):
+    raise_from_service(monkeypatch, httpx.ConnectError("connection refused"))
+
+    res = client.post(
+        "/internal/agent/reports/run",
+        json={"care_target_id": 18},
+        headers={"X-Internal-Key": KEY},
+    )
+
+    assert res.status_code == 502
+
+
+def test_endpoint_maps_llm_failure_to_502(client, monkeypatch):
+    """의존 서비스 장애를 우리 버그(500)와 구분한다."""
+    raise_from_service(monkeypatch, APIError("rate limited", request=None, body=None))
+
+    res = client.post(
+        "/internal/agent/reports/run",
+        json={"care_target_id": 18},
+        headers={"X-Internal-Key": KEY},
+    )
+
+    assert res.status_code == 502
 
 
 def test_endpoint_defaults_report_date_to_yesterday(client, wired, monkeypatch):

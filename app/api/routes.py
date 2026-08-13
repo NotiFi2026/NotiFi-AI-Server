@@ -2,7 +2,9 @@
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Header
+import httpx
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
+from openai import APIError
 from pydantic import BaseModel
 
 from app.agent import escalation_agent, report_service
@@ -74,6 +76,26 @@ class DailyReportRunRequest(BaseModel):
     report_date: Optional[date] = None
 
 
+def _spring_failure(exc: httpx.HTTPStatusError, care_target_id: int) -> HTTPException:
+    """Spring 내부 API 실패를 호출자가 고칠 수 있는 형태로 옮긴다.
+
+    전부 500으로 흘리면 운영자가 원인을 알 수 없다 — 특히 키 불일치는 설정 한 줄
+    문제인데 "Internal Server Error"만 보면 서버가 죽은 줄 안다.
+    """
+    status = exc.response.status_code
+    if status == 404:
+        return HTTPException(
+            status_code=404,
+            detail=f"care_target {care_target_id}을 Spring에서 찾을 수 없다(삭제됐거나 잘못된 ID)",
+        )
+    if status == 401:
+        return HTTPException(
+            status_code=502,
+            detail="Spring 내부 API 인증 실패 — SPRING_INTERNAL_KEY가 Spring의 INTERNAL_API_KEY와 다르다",
+        )
+    return HTTPException(status_code=502, detail=f"Spring 내부 API 실패 (status={status})")
+
+
 @router.post("/reports/run", response_model=DailyReportOutput)
 async def run_daily_report(
     body: DailyReportRunRequest,
@@ -90,4 +112,16 @@ async def run_daily_report(
     check_internal_key(x_internal_key)
 
     report_date = body.report_date or report_service.default_report_date()
-    return await report_service.run_daily_report(body.care_target_id, report_date)
+    try:
+        return await report_service.run_daily_report(body.care_target_id, report_date)
+    except httpx.HTTPStatusError as exc:
+        raise _spring_failure(exc, body.care_target_id) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Spring 서버에 연결할 수 없다: {exc}"
+        ) from exc
+    except APIError as exc:
+        # 의존 서비스(OpenAI) 장애를 우리 버그(500)와 구분한다
+        raise HTTPException(
+            status_code=502, detail=f"리포트 문장 생성 실패: {exc}"
+        ) from exc
