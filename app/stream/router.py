@@ -30,6 +30,10 @@ class PacketRouter:
     #: TX 링크 순서. DeviceConfig 필드명과 1:1이며 인덱스가 곧 링크 번호다
     LINK_FIELDS = ("tx1_id", "tx2_id", "tx3_id")
 
+    #: 미등록 MAC 기록 상한. 옆집 보드가 계속 잡히면 무한히 쌓여 장시간 운용에서 메모리가 샌다.
+    #: 목적은 "등록 안 된 보드가 있다"를 알리는 것이라 몇 개만 남으면 충분하다.
+    MAX_UNKNOWN_TRACKED = 64
+
     def __init__(self, buffers: BufferSet) -> None:
         self._buffers = buffers
         self._lock = threading.Lock()
@@ -63,7 +67,7 @@ class PacketRouter:
         with self._lock:
             target = self._by_mac.get(mac)
             first_time = target is None and mac not in self._unknown_seen
-            if target is None:
+            if target is None and len(self._unknown_seen) < self.MAX_UNKNOWN_TRACKED:
                 self._unknown_seen.add(mac)
 
         if target is None:

@@ -22,6 +22,11 @@ from app.model import pipeline
 #: HTTP는 BackgroundTasks, 데몬은 asyncio.create_task — 여기서 정하면 둘 중 하나가 어색해진다.
 DangerScheduler = Callable[[ModelResult, dict[str, Any]], None]
 
+#: 전송 직전 마지막 관문. False면 적재하지 않는다.
+#: **강등이 끝난 ModelResult를 받는다** — 저품질 danger는 여기 도달할 때 이미 WARNING이다.
+#: 데몬의 재신고 억제가 이걸 쓴다(원본 판정으로 억제하면 강등된 윈도가 진짜 낙상을 막는다).
+IngestGate = Callable[[ModelResult], bool]
+
 
 async def deliver(
     pred: dict[str, Any],
@@ -31,6 +36,7 @@ async def deliver(
     spring_device_id: int | None,
     detected_at: datetime,
     schedule_danger: DangerScheduler,
+    gate: IngestGate | None = None,
 ) -> dict[str, Any]:
     """추론 dict → I1 적재 → (비정상이면) I5 클립 → (danger면) 에스컬레이션.
 
@@ -40,6 +46,14 @@ async def deliver(
     """
     model_result = pipeline.to_model_result(pred, care_target_id, spring_device_id, detected_at)
     activity_class = model_result.activity_class
+
+    if gate is not None and not gate(model_result):
+        return {
+            "sent": False,
+            "reason": "gated",
+            "activity_class": activity_class,
+            "risk_level": model_result.risk_level.value,
+        }
 
     if not pipeline.should_send(device_id, model_result.event_type, activity_class, detected_at):
         logger.info(
