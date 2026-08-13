@@ -1,4 +1,4 @@
-"""Spring 백엔드 내부 API 클라이언트 (I1·I2·I3·I5)."""
+"""Spring 백엔드 내부 API 클라이언트 (I1·I2·I3·I5·I6)."""
 from datetime import datetime
 from typing import Any, Optional
 
@@ -93,22 +93,60 @@ async def record_escalation_step(
     return data
 
 
+async def get_daily_metrics(care_target_id: int, report_date: str) -> dict[str, Any]:
+    """I6: 리포트 생성용 하루치 집계 조회.
+
+    이벤트 카운트의 단일 출처는 Spring DB다 — 에이전트 서버는 저장소가 없으므로
+    하루치를 자체 유지할 수 없고, 여기서 읽은 값과 Spring이 저장한 이벤트가 어긋나지 않는다.
+    하루 경계는 Spring이 Asia/Seoul 기준으로 자른다.
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{_BASE}/care-targets/{care_target_id}/daily-metrics",
+            params={"date": report_date},
+            headers=_HEADERS,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    data = resp.json()["data"]
+    logger.info(
+        "일일 집계 조회 완료",
+        extra={
+            "action": "spring_i6_completed",
+            "care_target_id": care_target_id,
+            "report_date": report_date,
+            "warning_event_count": data.get("warning_event_count"),
+            "danger_event_count": data.get("danger_event_count"),
+        },
+    )
+    return data
+
+
 async def save_daily_report(
     care_target_id: int,
     report_date: str,
     sections: list[dict[str, Any]],
     metrics: dict[str, Any],
+    generated_at: Optional[datetime] = None,
 ) -> None:
-    """I3: 일일 리포트 적재."""
+    """I3: 일일 리포트 적재. (care_target_id, report_date) 기준 UPSERT.
+
+    `generated_at`을 생략하면 Spring이 수신 시각으로 채운다. 생성 시각을 아는 쪽은
+    우리이므로 넘기는 편이 정확하다 — 선택 인자인 것은 기존 호출부 호환 때문이다.
+    """
+    body: dict[str, Any] = {
+        "care_target_id": care_target_id,
+        "report_date": report_date,
+        "sections": sections,
+        "metrics": metrics,
+    }
+    if generated_at:
+        body["generated_at"] = generated_at.isoformat()
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{_BASE}/reports",
-            json={
-                "care_target_id": care_target_id,
-                "report_date": report_date,
-                "sections": sections,
-                "metrics": metrics,
-            },
+            json=body,
             headers=_HEADERS,
             timeout=10.0,
         )
@@ -119,6 +157,10 @@ async def save_daily_report(
             "action": "spring_i3_completed",
             "care_target_id": care_target_id,
             "report_date": report_date,
+            # 신규 생성일 때만 보호자 푸시가 나간다 — 재적재는 갱신(200).
+            # 키 이름에 `created`를 쓰면 안 된다. LogRecord의 예약 속성이라
+            # extra로 덮는 순간 KeyError로 로깅이 터진다(적재는 이미 끝난 뒤라 더 헷갈린다).
+            "newly_created": resp.status_code == 201,
         },
     )
 
