@@ -1,5 +1,6 @@
 """일일 리포트 스케줄러 — 실행 시각 계산·대상 가구 수집·실패 격리. LLM·Spring 없이 돈다."""
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -128,3 +129,63 @@ async def test_start_holds_a_strong_task_reference(monkeypatch):
 
     await scheduler.stop()
     assert scheduler._task is None
+
+
+@pytest.mark.asyncio
+async def test_loop_actually_runs_a_batch_at_the_target_time(registry, monkeypatch):
+    """예약 계산만 맞고 루프가 배치를 안 부르면 아무 소용이 없다 — 실제 발화를 확인한다."""
+    fired = asyncio.Event()
+    called: list[int] = []
+
+    async def fake_run(care_target_id, report_date):
+        called.append(care_target_id)
+        if len(called) == 3:
+            fired.set()
+
+    monkeypatch.setattr(report_scheduler, "run_daily_report", fake_run)
+    # 목표 시각을 코앞으로 당긴다 — 테스트가 하루를 기다릴 수는 없다
+    monkeypatch.setattr(
+        report_scheduler,
+        "next_run_at",
+        lambda now, hour, minute: now + timedelta(milliseconds=20),
+    )
+
+    scheduler = ReportScheduler(settings)
+    scheduler.start()
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=3)
+    finally:
+        await scheduler.stop()
+
+    assert called[:3] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_loop_survives_a_failure_outside_run_batch(registry, monkeypatch):
+    """run_batch **바깥**에서 터지는 예외(설정 오타 등)로 스케줄러가 죽으면 안 된다.
+
+    죽으면 로그 한 줄 없이 조용히 멈추고, 그 예외는 종료 시 stop()에서 엉뚱하게 다시 터진다.
+    """
+    monkeypatch.setattr(report_scheduler, "_RETRY_SECONDS", 0.01)
+    recovered = asyncio.Event()
+    attempts = 0
+
+    def flaky_next_run(now, hour, minute):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("hour must be in 0..23")  # NOTIFI_REPORT_HOUR_KST=24 같은 오타
+        recovered.set()
+        return now + timedelta(seconds=60)
+
+    monkeypatch.setattr(report_scheduler, "next_run_at", flaky_next_run)
+
+    scheduler = ReportScheduler(settings)
+    scheduler.start()
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=3)
+        assert not scheduler._task.done()  # 첫 실패를 넘기고 살아 있다
+    finally:
+        await scheduler.stop()
+
+    assert attempts >= 2

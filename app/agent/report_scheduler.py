@@ -24,6 +24,10 @@ from app.model.pipeline import care_target_id_from
 #: 리포트의 "하루" 경계 — report_service·Spring I6와 같은 존이어야 날짜가 어긋나지 않는다.
 KST = ZoneInfo("Asia/Seoul")
 
+#: 주기 계산 자체가 실패했을 때 다시 시도하기까지. 설정 오타처럼 매번 즉시 터지는 실패에서
+#: 바쁜 루프가 되지 않을 만큼 길고, 일시적 오류라면 그날 안에 회복될 만큼 짧다.
+_RETRY_SECONDS = 300
+
 
 def next_run_at(now_utc: datetime, hour: int, minute: int) -> datetime:
     """다음 실행 시각(UTC). KST 기준 오늘 hour:minute이 이미 지났으면 내일이다."""
@@ -45,12 +49,23 @@ def list_care_target_ids(registry_root: str) -> list[int]:
         return []
 
     ids: list[int] = []
+    skipped: list[str] = []
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
             continue
         care_target_id = care_target_id_from(entry.name)
         if care_target_id is not None:
             ids.append(care_target_id)
+        else:
+            skipped.append(entry.name)
+
+    if skipped:
+        # 조용히 넘기지 않는다 — 건너뛴 가구는 리포트를 **영영** 못 받는데,
+        # 로그가 없으면 아무도 그 사실을 모른다(report_service가 버린 클래스를 남기는 것과 같은 관례)
+        logger.warning(
+            "device_id 규약을 안 따르는 항목 제외 — 이 가구는 리포트를 받지 못한다",
+            extra={"action": "report_targets_skipped", "skipped": skipped},
+        )
     return ids
 
 
@@ -91,28 +106,47 @@ class ReportScheduler:
             self._task = None
 
     async def _loop(self) -> None:
+        """예외가 나도 루프는 살아 있어야 한다 — `StreamPump._window_loop`과 같은 모양이다.
+
+        `run_batch`는 가구별 실패를 이미 격리하지만 그 **바깥**에도 터질 곳이 있다:
+        설정 오타(`NOTIFI_REPORT_HOUR_KST=24`)면 `next_run_at`이 ValueError를 내고,
+        레지스트리 디렉터리 권한 문제면 `list_care_target_ids`가 OSError를 낸다.
+        여기서 안 잡으면 태스크가 **로그 한 줄 없이** 죽고, 그 예외는 한참 뒤
+        종료 시 `stop()`의 `await self._task`에서 엉뚱하게 다시 터진다.
+        """
         while not self._stop.is_set():
-            now = datetime.now(timezone.utc)
-            target = next_run_at(
-                now,
-                self._config.notifi_report_hour_kst,
-                self._config.notifi_report_minute_kst,
-            )
-            wait_seconds = (target - now).total_seconds()
-            logger.info(
-                "다음 리포트 배치 대기",
-                extra={
-                    "action": "report_batch_scheduled",
-                    "run_at": target.isoformat(),
-                    "wait_seconds": round(wait_seconds),
-                },
-            )
             try:
+                now = datetime.now(timezone.utc)
+                target = next_run_at(
+                    now,
+                    self._config.notifi_report_hour_kst,
+                    self._config.notifi_report_minute_kst,
+                )
+                wait_seconds = (target - now).total_seconds()
+                logger.info(
+                    "다음 리포트 배치 대기",
+                    extra={
+                        "action": "report_batch_scheduled",
+                        "run_at": target.isoformat(),
+                        "wait_seconds": round(wait_seconds),
+                    },
+                )
                 await asyncio.sleep(wait_seconds)
+                await self.run_batch()
             except asyncio.CancelledError:
                 raise
-
-            await self.run_batch()
+            except Exception as exc:  # noqa: BLE001 - 한 번의 실패로 스케줄러가 죽으면 안 된다
+                logger.error(
+                    "리포트 스케줄 주기 실패 — 잠시 뒤 다시 시도한다",
+                    extra={
+                        "action": "report_schedule_cycle_failed",
+                        "error": str(exc),
+                        "retry_in_seconds": _RETRY_SECONDS,
+                    },
+                    exc_info=True,
+                )
+                # 설정이 잘못돼 매번 즉시 터지는 경우 바쁜 루프가 되지 않게 한 박자 쉰다
+                await asyncio.sleep(_RETRY_SECONDS)
 
     async def run_batch(self) -> int:
         """감시 중인 모든 가구의 어제 리포트를 만든다. 생성에 성공한 가구 수를 반환한다.
