@@ -59,5 +59,14 @@ class Settings(BaseSettings):
     notifi_stream_replay_speed: float = 1.0
     notifi_stream_replay_loop: bool = False
 
+    # ── 일일 리포트 스케줄러 ────────────────────────────────────────────────
+    # 수집 데몬과 같은 이유로 기본은 꺼 둔다 — 개발 환경에서 켜지면 매일 LLM을 호출한다
+    notifi_report_scheduler_enabled: bool = False
+    # 아침에 어제 리포트가 도착하게. 대상일은 report_service.default_report_date()(KST 어제)
+    notifi_report_hour_kst: int = 8
+    # 분까지 두는 건 취향이 아니라 검증 때문이다 — 시 단위만 있으면 발화를 보려고
+    # 한 시간을 기다려야 한다
+    notifi_report_minute_kst: int = 0
+
 
 settings = Settings()

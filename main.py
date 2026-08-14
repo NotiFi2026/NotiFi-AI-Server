@@ -58,11 +58,30 @@ async def lifespan(app: FastAPI):
                 exc_info=True,
             )
 
+    # 리포트는 I6 조회 → LLM → I3 적재라 모델이 필요 없다 — 모델 로드가 실패해도 스케줄러는 뜬다
+    app.state.report_scheduler = None
+    if settings.notifi_report_scheduler_enabled:
+        try:
+            from app.agent.report_scheduler import ReportScheduler
+
+            scheduler = ReportScheduler(settings)
+            scheduler.start()
+            app.state.report_scheduler = scheduler
+        except Exception as exc:
+            # 스케줄러가 안 떠도 서버는 살아 있어야 한다 — 수동 리포트 라우트는 그대로 쓸 수 있다
+            logger.error(
+                "리포트 스케줄러 기동 실패 — 스케줄러 없이 기동한다",
+                extra={"action": "report_scheduler_start_failed", "error": str(exc)},
+                exc_info=True,
+            )
+
     try:
         yield
     finally:
         if app.state.stream_pump is not None:
             await app.state.stream_pump.stop()
+        if app.state.report_scheduler is not None:
+            await app.state.report_scheduler.stop()
 
 
 app = FastAPI(title="Notifi AI Server", lifespan=lifespan)
