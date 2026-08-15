@@ -84,8 +84,25 @@ async def deliver(
 
     pipeline.mark_sent(device_id, activity_class, detected_at)
 
+    # **Spring이 새로 시작했을 때만 에이전트를 띄운다.**
+    #
+    # danger라는 이유만으로 띄우면, 한 번의 낙상이 만드는 겹치는 윈도마다 음성 확인이
+    # 처음부터 다시 돈다 — 어르신 입장에서 "괜찮다고 했는데 또 물어본다". Spring은 이미
+    # 대응 중이면 새 에스컬레이션을 만들지 않고 escalation_triggered=false로 답하므로,
+    # 그 신호를 그대로 따르면 된다. 진행 중인 건에는 이미 다른 에이전트가 붙어 있다.
+    escalation_triggered = bool(saved.get("escalation_triggered", False))
     if model_result.risk_level is RiskLevel.DANGER:
-        schedule_danger(model_result, saved)
+        if escalation_triggered:
+            schedule_danger(model_result, saved)
+        else:
+            logger.info(
+                "이미 진행 중인 대응 — 에이전트 생략",
+                extra={
+                    "action": "escalation_reused",
+                    "device_id": device_id,
+                    "escalation_id": saved.get("escalation_id"),
+                },
+            )
 
     return {
         "sent": True,
@@ -94,6 +111,8 @@ async def deliver(
         "activity_class": activity_class,
         "risk_level": model_result.risk_level.value,
         "risk_score": model_result.risk_score,
-        "escalation_triggered": saved.get("escalation_triggered", False),
+        "escalation_triggered": escalation_triggered,
+        # 재사용된 건도 id는 온다 — 호출자가 "대응이 붙어 있다"를 판단하는 근거다
+        "escalation_id": saved.get("escalation_id"),
         "pose_clip_id": pose_clip_id,
     }

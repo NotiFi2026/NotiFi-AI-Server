@@ -106,6 +106,25 @@ async def _submit_sensing_event(state: EscalationState) -> dict:
 
 async def _select_response_policy(state: EscalationState) -> dict:
     policy = select_policy(state["risk_level"])
+
+    if (
+        policy == "voice_check_required"
+        and state.get("escalation_id")
+        and not state.get("escalation_triggered")
+    ):
+        # Spring이 새로 만들지 않고 진행 중인 건에 합쳤다 — 그 건에는 이미 대응이 붙어 있다.
+        # 여기서 또 음성 확인을 시작하면 어르신은 "괜찮다고 했는데 또 물어본다"를 겪는다.
+        # (id가 있으면서 triggered=false인 경우는 이 재사용뿐이다. 멱등 재적재는 true를 준다.)
+        logger.info(
+            "이미 진행 중인 대응 — 음성 확인 생략",
+            extra={
+                "action": "escalation_reused",
+                "care_target_id": state["care_target_id"],
+                "escalation_id": state.get("escalation_id"),
+            },
+        )
+        policy = "safe_record_only"
+
     if policy == "voice_check_required" and not state.get("escalation_id"):
         # 멱등 재적재 등으로 Spring이 escalation_id를 주지 않은 경우.
         # 그대로 진행하면 /escalations/None/steps 로 POST한다.

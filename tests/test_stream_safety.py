@@ -123,8 +123,17 @@ def make_pump():
     return StreamPump(StubRuntime(), settings)
 
 
-def deliver_through_pump(pump, pred, *, escalation_triggered: bool, window_end: float):
-    saved = {"sensing_event_id": 1, "escalation_triggered": escalation_triggered}
+def deliver_through_pump(
+    pump, pred, *, escalation_triggered: bool, window_end: float, escalation_id: int | None = None
+):
+    # Spring은 새로 만들었으면 triggered=True + id, 진행 중 건에 합쳤으면 False + 그 id를 준다
+    if escalation_id is None and escalation_triggered:
+        escalation_id = 1
+    saved = {
+        "sensing_event_id": 1,
+        "escalation_triggered": escalation_triggered,
+        "escalation_id": escalation_id,
+    }
 
     async def run():
         with patch.object(
@@ -165,6 +174,86 @@ def test_real_escalation_arms_cooldown():
     )
 
     assert not pump.cooldown.allows("care-1", 101.0)
+
+
+def test_reused_escalation_also_arms_cooldown():
+    """**진행 중인 건에 합쳐진 윈도도 억제해야 한다.**
+
+    Spring은 이미 대응 중이면 새 에스컬레이션을 만들지 않고 `escalation_triggered=false` +
+    기존 id로 답한다. 그 값을 "에스컬레이션 없음"으로 읽으면 억제가 안 걸려 stride(2초)마다
+    I1이 계속 나간다 — 대응은 하나인데 이벤트만 쌓인다.
+    """
+    pytest.importorskip("notifi_ai")
+    pump = make_pump()
+
+    deliver_through_pump(
+        pump, make_pred("danger", low_quality=False),
+        escalation_triggered=False, escalation_id=7, window_end=100.0,
+    )
+
+    assert not pump.cooldown.allows("care-1", 101.0)
+
+
+def test_reused_escalation_does_not_start_second_agent():
+    """**"괜찮다고 했는데 또 물어본다"의 실제 원인.**
+
+    danger라는 이유만으로 에이전트를 띄우면 겹치는 윈도마다 음성 확인이 처음부터 다시 돈다.
+    Spring이 대응을 재사용했다고 답하면 그 건에는 이미 에이전트가 붙어 있다.
+    """
+    pytest.importorskip("notifi_ai")
+    scheduled: list = []
+
+    async def run():
+        with patch.object(
+            ingest_service.spring_client,
+            "send_sensing_event",
+            new=AsyncMock(return_value={
+                "sensing_event_id": 1, "escalation_triggered": False, "escalation_id": 7,
+            }),
+        ), patch.object(
+            ingest_service.spring_client, "send_pose_clip", new=AsyncMock(return_value={})
+        ):
+            return await ingest_service.deliver(
+                make_pred("danger", low_quality=False),
+                device_id="care-1",
+                care_target_id=1,
+                spring_device_id=None,
+                detected_at=DETECTED_AT,
+                schedule_danger=lambda *args: scheduled.append(args),
+            )
+
+    result = asyncio.run(run())
+    assert scheduled == [], "재사용된 대응에 에이전트를 또 띄웠다 — 음성 확인이 반복된다"
+    assert result["escalation_id"] == 7
+    assert result["escalation_triggered"] is False
+
+
+def test_new_escalation_starts_agent():
+    """반대로 새로 시작된 건에는 반드시 에이전트가 붙어야 한다 — 안 붙으면 아무 대응도 없다."""
+    pytest.importorskip("notifi_ai")
+    scheduled: list = []
+
+    async def run():
+        with patch.object(
+            ingest_service.spring_client,
+            "send_sensing_event",
+            new=AsyncMock(return_value={
+                "sensing_event_id": 1, "escalation_triggered": True, "escalation_id": 9,
+            }),
+        ), patch.object(
+            ingest_service.spring_client, "send_pose_clip", new=AsyncMock(return_value={})
+        ):
+            await ingest_service.deliver(
+                make_pred("danger", low_quality=False),
+                device_id="care-1",
+                care_target_id=1,
+                spring_device_id=None,
+                detected_at=DETECTED_AT,
+                schedule_danger=lambda *args: scheduled.append(args),
+            )
+
+    asyncio.run(run())
+    assert len(scheduled) == 1
 
 
 def test_second_real_fall_passes_after_downgraded_one():
@@ -480,3 +569,37 @@ def test_low_coverage_trial_is_rejected():
     store = SessionStore(buffers, FAKE_SPEC)
     with pytest.raises(NotEnoughSignal, match="유효 프레임"):
         store.capture("care-1", None)
+
+
+# ── E. 진행 중인 대응에 음성 확인을 겹쳐 시작하지 않는다 ─────────────────────
+
+def test_agent_skips_voice_check_when_escalation_reused():
+    """`/internal/agent/run` 경로(prefetched 없음)에서도 같은 규칙이 지켜져야 한다.
+
+    에이전트가 직접 I1을 보내면 Spring이 진행 중 건의 id를 `escalation_triggered=false`와
+    함께 준다. 그걸 무시하고 정책을 고르면 음성 확인이 또 돈다.
+    """
+    pytest.importorskip("notifi_ai")
+    from app.agent import escalation_agent
+
+    reused = {
+        "risk_level": "danger",
+        "event_type": "FALL",
+        "care_target_id": 1,
+        "escalation_id": 7,
+        "escalation_triggered": False,
+    }
+    fresh = {
+        "risk_level": "danger",
+        "event_type": "FALL",
+        "care_target_id": 1,
+        "escalation_id": 9,
+        "escalation_triggered": True,
+    }
+
+    assert asyncio.run(escalation_agent._select_response_policy(reused))[
+        "response_policy"
+    ] == "safe_record_only"
+    assert asyncio.run(escalation_agent._select_response_policy(fresh))[
+        "response_policy"
+    ] == "voice_check_required"
