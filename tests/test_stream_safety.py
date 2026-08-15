@@ -198,11 +198,12 @@ def test_second_real_fall_passes_after_downgraded_one():
 class FakeDeviceConfig:
     """레지스트리 DeviceConfig 중 라우터가 실제로 읽는 필드만."""
 
-    def __init__(self, device_id: str, tx1_id=None, tx2_id=None, tx3_id=None):
+    def __init__(self, device_id: str, tx1_id=None, tx2_id=None, tx3_id=None, rx_id=None):
         self.device_id = device_id
         self.tx1_id = tx1_id
         self.tx2_id = tx2_id
         self.tx3_id = tx3_id
+        self.rx_id = rx_id
 
 
 def feed(router, mac: str, at: float) -> None:
@@ -279,6 +280,30 @@ def test_removed_board_stops_being_reported():
     assert router.alive_boards(since=0.0) == {}
 
 
+def test_rx_board_is_reported_alive_from_tx_traffic():
+    """**RX는 CSI 라인의 sender로 절대 등장하지 않는다.**
+
+    TX만 보고하면 정작 그 라인을 뽑아내고 있는 RX 노드 하나가 앱에서 영원히
+    "신호 없음"으로 남는다. TX 패킷이 도착했다는 사실 자체가 RX 생존의 증거다.
+    """
+    pytest.importorskip("notifi_ai")
+    router = make_router()
+    router.reload([FakeDeviceConfig("care-1", tx1_id="aa", rx_id="RX-01")])
+
+    feed(router, "aa", 100.0)
+
+    assert router.alive_boards(since=99.0) == {"aa": 100.0, "RX-01": 100.0}
+
+
+def test_rx_board_is_not_reported_without_traffic():
+    """반대로 아무 패킷도 안 오면 RX도 살아 있다고 말할 수 없다."""
+    pytest.importorskip("notifi_ai")
+    router = make_router()
+    router.reload([FakeDeviceConfig("care-1", tx1_id="aa", rx_id="RX-01")])
+
+    assert router.alive_boards(since=0.0) == {}
+
+
 def make_pump_with_live_board(interval: float = 60.0):
     pump = make_pump()
     pump._config = pump._config.model_copy(
@@ -289,6 +314,12 @@ def make_pump_with_live_board(interval: float = 60.0):
     return pump
 
 
+async def drain_heartbeats(pump) -> None:
+    """발송 태스크가 끝날 때까지. 전송은 루프에 맡기고 즉시 돌아오는 게 정상 동작이다."""
+    while pump._heartbeat_tasks:
+        await asyncio.gather(*list(pump._heartbeat_tasks), return_exceptions=True)
+
+
 def test_heartbeat_is_sent_once_per_interval():
     """윈도 루프는 stride(2초)마다 도는데 하트비트까지 매번 보내면 Spring을 두드리기만 한다."""
     pytest.importorskip("notifi_ai")
@@ -297,14 +328,56 @@ def test_heartbeat_is_sent_once_per_interval():
 
     async def run():
         with patch.object(stream_client(), "send_heartbeat", new=sender):
-            await pump._flush_heartbeats(100.0)
-            await pump._flush_heartbeats(102.0)  # stride만 지났다 — 아직 주기가 아니다
+            pump._flush_heartbeats(100.0)
+            pump._flush_heartbeats(102.0)  # stride만 지났다 — 아직 주기가 아니다
             feed(pump.router, "aa", 161.0)
-            await pump._flush_heartbeats(161.0)
+            pump._flush_heartbeats(161.0)
+            await drain_heartbeats(pump)
 
     asyncio.run(run())
     assert sender.await_count == 2
     assert pump.stats["heartbeats"] == 2
+
+
+def test_flush_does_not_wait_for_spring():
+    """**이번 셀프 리뷰의 핵심 회귀.**
+
+    예외를 삼키는 것만으로는 판정 루프를 지키지 못한다. 하트비트를 `await`로 보내면
+    Spring이 응답하지 않을 때 보드 수 × 타임아웃(5초)만큼 윈도 처리가 통째로 밀리고,
+    그 시간은 낙상 감지의 사각지대가 된다. 발송은 태스크로 떠나야 한다.
+    """
+    pytest.importorskip("notifi_ai")
+    pump = make_pump_with_live_board()
+
+    blocked = None
+
+    async def body():
+        nonlocal blocked
+        blocked = asyncio.Event()
+
+        async def never_returns(_uid):
+            await blocked.wait()  # Spring이 응답하지 않는 상황
+
+        with patch.object(stream_client(), "send_heartbeat", new=never_returns):
+            pump._flush_heartbeats(100.0)
+            # 여기까지 왔다는 것 자체가 "기다리지 않았다"는 뜻이다
+            assert len(pump._heartbeat_tasks) == 1
+            assert not next(iter(pump._heartbeat_tasks)).done()
+
+            await pump.stop()  # 정지가 미완 하트비트에 붙잡히지 않는다
+
+    async def run():
+        # 발송을 다시 await로 되돌리면 여기서 영원히 멈춘다.
+        # 타임아웃이 없으면 "회귀 = 테스트 무한 대기"가 되어 실패로 보이지 않는다
+        try:
+            await asyncio.wait_for(body(), timeout=2.0)
+        except asyncio.TimeoutError:
+            raise AssertionError("하트비트 발송이 윈도 루프를 붙잡았다")
+        finally:
+            if blocked is not None:
+                blocked.set()
+
+    asyncio.run(run())
 
 
 def test_heartbeat_failure_does_not_break_the_window_loop():
@@ -320,7 +393,8 @@ def test_heartbeat_failure_does_not_break_the_window_loop():
             "send_heartbeat",
             new=AsyncMock(side_effect=httpx.ConnectError("spring down")),
         ):
-            await pump._flush_heartbeats(100.0)
+            pump._flush_heartbeats(100.0)
+            await drain_heartbeats(pump)
 
     asyncio.run(run())  # 예외가 올라오면 실패한다
     assert pump.stats["heartbeats"] == 0
@@ -333,9 +407,11 @@ def test_unregistered_board_warns_once(caplog):
 
     async def run():
         with patch.object(stream_client(), "send_heartbeat", new=AsyncMock(return_value=False)):
-            await pump._flush_heartbeats(100.0)
+            pump._flush_heartbeats(100.0)
+            await drain_heartbeats(pump)
             feed(pump.router, "aa", 161.0)
-            await pump._flush_heartbeats(161.0)
+            pump._flush_heartbeats(161.0)
+            await drain_heartbeats(pump)
 
     with caplog.at_level("WARNING"):
         asyncio.run(run())
@@ -352,7 +428,8 @@ def test_heartbeat_can_be_disabled():
 
     async def run():
         with patch.object(stream_client(), "send_heartbeat", new=sender):
-            await pump._flush_heartbeats(100.0)
+            pump._flush_heartbeats(100.0)
+            await drain_heartbeats(pump)
 
     asyncio.run(run())
     sender.assert_not_awaited()

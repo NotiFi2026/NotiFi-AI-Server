@@ -30,6 +30,9 @@ class PacketRouter:
     #: TX 링크 순서. DeviceConfig 필드명과 1:1이며 인덱스가 곧 링크 번호다
     LINK_FIELDS = ("tx1_id", "tx2_id", "tx3_id")
 
+    #: RX 보드. 라우팅에는 안 쓰이지만 생존 보고에는 필요하다(아래 alive_boards 참고)
+    RX_FIELD = "rx_id"
+
     #: 미등록 MAC 기록 상한. 옆집 보드가 계속 잡히면 무한히 쌓여 장시간 운용에서 메모리가 샌다.
     #: 목적은 "등록 안 된 보드가 있다"를 알리는 것이라 몇 개만 남으면 충분하다.
     MAX_UNKNOWN_TRACKED = 64
@@ -43,11 +46,14 @@ class PacketRouter:
         self._registered_uid: dict[str, str] = {}
         #: 정규화 MAC → 마지막으로 패킷을 받은 시각(monotonic). 하트비트 대상 판정에 쓴다
         self._last_seen: dict[str, float] = {}
+        #: device_id → RX 보드 uid. RX는 송신을 안 해 MAC 매핑에 들어갈 수 없다
+        self._rx_uid: dict[str, str] = {}
 
     def reload(self, devices: list) -> None:
         """레지스트리의 DeviceConfig 목록으로 매핑을 다시 만든다(등록·삭제 후 호출)."""
         mapping: dict[str, tuple[str, int]] = {}
         registered: dict[str, str] = {}
+        rx_uid: dict[str, str] = {}
         for config in devices:
             for index, field in enumerate(self.LINK_FIELDS):
                 board_id = getattr(config, field, None)
@@ -55,9 +61,13 @@ class PacketRouter:
                     mac = _normalize(board_id)
                     mapping[mac] = (config.device_id, index)
                     registered[mac] = board_id
+            rx_board = getattr(config, self.RX_FIELD, None)
+            if rx_board:
+                rx_uid[config.device_id] = rx_board
         with self._lock:
             self._by_mac = mapping
             self._registered_uid = registered
+            self._rx_uid = rx_uid
             self._unknown_seen.clear()
             # 등록이 빠진 보드의 수신 기록은 버린다 — 남기면 지운 보드에 하트비트가 계속 나간다
             self._last_seen = {
@@ -99,17 +109,31 @@ class PacketRouter:
         return True
 
     def alive_boards(self, since: float) -> dict[str, float]:
-        """`since` 이후에 패킷이 온 보드의 {등록 원문 uid: 마지막 수신 시각}.
+        """`since` 이후에 살아 있는 것으로 확인된 보드의 {등록 원문 uid: 확인 시각}.
+
+        **RX도 포함한다.** RX는 수신 전용이라 CSI 라인의 sender로 절대 등장하지 않는다.
+        그 보드만 빼고 보고하면 앱 디바이스 목록에서 RX 노드 하나가 영원히 "신호 없음"으로
+        남는다 — 정작 그 보드가 지금 라인을 뽑아내고 있는데도. TX 패킷이 도착했다는 사실
+        자체가 그것을 받아 넘긴 RX가 살아 있다는 증거다.
 
         수신은 리더 스레드가, 소비는 이벤트 루프가 한다. 스냅샷을 복사해 넘기는 건
         호출부가 락 밖에서 네트워크 호출을 하기 때문이다.
         """
+        alive: dict[str, float] = {}
         with self._lock:
-            return {
-                self._registered_uid[mac]: at
-                for mac, at in self._last_seen.items()
-                if at >= since and mac in self._registered_uid
-            }
+            for mac, at in self._last_seen.items():
+                if at < since:
+                    continue
+                uid = self._registered_uid.get(mac)
+                if uid is None:
+                    continue
+                alive[uid] = at
+
+                target = self._by_mac.get(mac)
+                rx = self._rx_uid.get(target[0]) if target else None
+                if rx is not None:
+                    alive[rx] = max(alive.get(rx, at), at)
+        return alive
 
     def known_boards(self) -> int:
         with self._lock:

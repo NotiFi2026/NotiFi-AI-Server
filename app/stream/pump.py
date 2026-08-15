@@ -61,6 +61,8 @@ class StreamPump:
         self._agent_tasks: set[asyncio.Task] = set()
         #: 보드별 마지막 하트비트 전송 시각 — 주기를 지키는 기준
         self._last_heartbeat: dict[str, float] = {}
+        #: 발송 중인 하트비트 태스크. 에이전트와 달리 정지 시 취소해도 된다(부가 정보다)
+        self._heartbeat_tasks: set[asyncio.Task] = set()
         #: Spring에 등록되지 않아 404가 난 보드. 주기마다 같은 경고를 반복하지 않는다
         self._unregistered_warned: set[str] = set()
         self.stats = {
@@ -112,6 +114,9 @@ class StreamPump:
         if self._reader is not None:
             # 시리얼 timeout이 0.5초라 그 안에 빠져나온다. 안 죽어도 daemon 스레드라 종료를 막지 않는다
             self._reader.join(timeout=3.0)
+        for task in list(self._heartbeat_tasks):
+            # 에스컬레이션과 달리 취소해도 된다 — 못 보낸 하트비트는 다음 기동이 채운다
+            task.cancel()
         if self._agent_tasks:
             # 진행 중인 응급 대응은 취소하지 않는다 — 119 신고 직전에 끊는 셈이 된다.
             # 서버가 정말 내려가면 어차피 같이 죽지만, 그 사실은 남겨야 원인을 안다.
@@ -146,7 +151,7 @@ class StreamPump:
         while not self._stop.is_set():
             try:
                 await asyncio.sleep(stride)
-                await self._flush_heartbeats(time.monotonic())
+                self._flush_heartbeats(time.monotonic())
                 for buffer in self.buffers.active():
                     await self._process(buffer.device_id)
             except asyncio.CancelledError:
@@ -158,17 +163,21 @@ class StreamPump:
                     exc_info=True,
                 )
 
-    async def _flush_heartbeats(self, now: float) -> None:
+    def _flush_heartbeats(self, now: float) -> None:
         """송신 중인 보드마다 Spring에 생존 신호를 보낸다(I4).
 
         보드가 살아 있다는 걸 아는 건 CSI 라인을 받는 여기뿐이다. 이 호출이 없으면
         Spring의 `last_seen_at`이 갱신되지 않아, 노드가 멀쩡히 도는 동안에도 보호자 앱
         디바이스 화면은 "신호 없음"으로 남는다.
 
-        **판정 루프를 절대 방해하지 않는다.** 하트비트는 부가 정보이고 낙상 감지는 아니다 —
-        여기서 예외가 새면 그 stride의 윈도 처리가 통째로 날아간다. 그래서 실패를 안에서
-        삼키고, 실패한 보드도 주기만큼 쉬었다 재시도한다(Spring이 죽어 있으면 stride마다
-        재시도가 로그를 덮는다. 임계가 5분이라 한 주기 늦어도 상태는 뒤집히지 않는다).
+        **판정 루프를 기다리게 하지 않는다 — 그래서 await가 아니라 태스크다.**
+        예외를 삼키는 것만으로는 부족하다. 여기서 `await`로 보내면 Spring이 느리거나
+        응답하지 않을 때 보드 수 × 타임아웃(5초)만큼 윈도 처리가 통째로 밀린다.
+        낙상 판정이 20초 늦는 것과 디바이스 화면이 한 주기 늦게 갱신되는 것은
+        비교 대상이 아니다.
+
+        Spring이 죽어 있어도 실패한 보드는 주기만큼 쉬었다 재시도한다(stride마다
+        재시도하면 로그가 덮인다). 임계가 5분이라 한 주기 늦어도 상태는 뒤집히지 않는다.
         """
         interval = self._config.notifi_stream_heartbeat_seconds
         if interval <= 0:
@@ -178,31 +187,41 @@ class StreamPump:
             last = self._last_heartbeat.get(device_uid)
             if last is not None and now - last < interval:
                 continue
+            # 보내기 전에 찍는다 — 발송이 느려도 다음 stride가 중복 발송하지 않게
             self._last_heartbeat[device_uid] = now
-            try:
-                registered = await spring_client.send_heartbeat(device_uid)
-            except Exception as exc:  # noqa: BLE001 - 하트비트 실패가 감지를 막으면 안 된다
-                logger.warning(
-                    "하트비트 전송 실패",
-                    extra={
-                        "action": "stream_heartbeat_failed",
-                        "device_uid": device_uid,
-                        "error": str(exc),
-                    },
-                )
-                continue
+            # 에이전트 태스크와 같은 이유로 반환값을 붙잡는다: 루프는 약한 참조만 들고 있다
+            task = asyncio.create_task(self._send_heartbeat(device_uid))
+            self._heartbeat_tasks.add(task)
+            task.add_done_callback(self._heartbeat_tasks.discard)
 
-            if registered:
-                self.stats["heartbeats"] += 1
-                self._unregistered_warned.discard(device_uid)
-            elif device_uid not in self._unregistered_warned:
-                # 보드는 켰는데 앱에서 D1 등록을 안 했거나 MAC 표기가 어긋난 상태다.
-                # Spring은 device_uid를 완전 일치로 찾으므로 대소문자만 달라도 여기로 온다
-                self._unregistered_warned.add(device_uid)
-                logger.warning(
-                    "Spring에 등록되지 않은 보드 — 하트비트 무시됨",
-                    extra={"action": "stream_heartbeat_unregistered", "device_uid": device_uid},
-                )
+    async def _send_heartbeat(self, device_uid: str) -> None:
+        """하트비트 한 건. 실패는 여기서 끝난다 — 호출부는 윈도 루프다."""
+        try:
+            registered = await spring_client.send_heartbeat(device_uid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 하트비트 실패가 감지를 막으면 안 된다
+            logger.warning(
+                "하트비트 전송 실패",
+                extra={
+                    "action": "stream_heartbeat_failed",
+                    "device_uid": device_uid,
+                    "error": str(exc),
+                },
+            )
+            return
+
+        if registered:
+            self.stats["heartbeats"] += 1
+            self._unregistered_warned.discard(device_uid)
+        elif device_uid not in self._unregistered_warned:
+            # 보드는 켰는데 앱에서 D1 등록을 안 했거나 MAC 표기가 어긋난 상태다.
+            # Spring은 device_uid를 완전 일치로 찾으므로 대소문자만 달라도 여기로 온다
+            self._unregistered_warned.add(device_uid)
+            logger.warning(
+                "Spring에 등록되지 않은 보드 — 하트비트 무시됨",
+                extra={"action": "stream_heartbeat_unregistered", "device_uid": device_uid},
+            )
 
     async def _process(self, device_id: str) -> None:
         spec = self._runtime.spec
