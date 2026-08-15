@@ -345,9 +345,13 @@ class StreamPump:
 
         if result.get("sent"):
             self.stats["sent"] += 1
-            if result.get("escalation_triggered"):
-                # Spring이 실제로 에스컬레이션을 시작했을 때만 억제한다 —
-                # "적재됐다"나 "모델이 danger라 했다"가 아니라 이게 유일하게 정직한 신호다
+            if result.get("escalation_id"):
+                # **대응이 붙었으면** 억제한다 — 새로 시작했든(triggered) 진행 중인 건에
+                # 합쳐졌든(reused) 이 낙상은 이미 처리되고 있다.
+                #
+                # "모델이 danger라 했다"나 "적재됐다"로 판단하면 안 되고, 반대로
+                # escalation_triggered만 보면 재사용된 윈도가 억제를 못 걸어 stride(2초)마다
+                # I1이 계속 나간다. Spring이 대응 id를 주는 것이 유일하게 정직한 신호다.
                 self.cooldown.mark(device_id, window_end)
             logger.info(
                 "실시간 판정 적재",
