@@ -39,18 +39,30 @@ class PacketRouter:
         self._lock = threading.Lock()
         self._by_mac: dict[str, tuple[str, int]] = {}
         self._unknown_seen: set[str] = set()
+        #: 정규화 MAC → 등록 당시 원문. 하트비트는 Spring에 등록된 문자열 그대로 보내야 한다
+        self._registered_uid: dict[str, str] = {}
+        #: 정규화 MAC → 마지막으로 패킷을 받은 시각(monotonic). 하트비트 대상 판정에 쓴다
+        self._last_seen: dict[str, float] = {}
 
     def reload(self, devices: list) -> None:
         """레지스트리의 DeviceConfig 목록으로 매핑을 다시 만든다(등록·삭제 후 호출)."""
         mapping: dict[str, tuple[str, int]] = {}
+        registered: dict[str, str] = {}
         for config in devices:
             for index, field in enumerate(self.LINK_FIELDS):
                 board_id = getattr(config, field, None)
                 if board_id:
-                    mapping[_normalize(board_id)] = (config.device_id, index)
+                    mac = _normalize(board_id)
+                    mapping[mac] = (config.device_id, index)
+                    registered[mac] = board_id
         with self._lock:
             self._by_mac = mapping
+            self._registered_uid = registered
             self._unknown_seen.clear()
+            # 등록이 빠진 보드의 수신 기록은 버린다 — 남기면 지운 보드에 하트비트가 계속 나간다
+            self._last_seen = {
+                mac: at for mac, at in self._last_seen.items() if mac in mapping
+            }
         logger.info(
             "수집 매핑 갱신",
             extra={"action": "stream_map_reload", "boards": len(mapping)},
@@ -69,6 +81,9 @@ class PacketRouter:
             first_time = target is None and mac not in self._unknown_seen
             if target is None and len(self._unknown_seen) < self.MAX_UNKNOWN_TRACKED:
                 self._unknown_seen.add(mac)
+            if target is not None:
+                # 등록된 보드만 기록한다 — 미등록 MAC은 Spring에도 없어 하트비트를 보낼 곳이 없다
+                self._last_seen[mac] = at
 
         if target is None:
             if first_time:
@@ -82,6 +97,19 @@ class PacketRouter:
         device_id, link_index = target
         self._buffers.get(device_id).add(link_index, at, iq)
         return True
+
+    def alive_boards(self, since: float) -> dict[str, float]:
+        """`since` 이후에 패킷이 온 보드의 {등록 원문 uid: 마지막 수신 시각}.
+
+        수신은 리더 스레드가, 소비는 이벤트 루프가 한다. 스냅샷을 복사해 넘기는 건
+        호출부가 락 밖에서 네트워크 호출을 하기 때문이다.
+        """
+        with self._lock:
+            return {
+                self._registered_uid[mac]: at
+                for mac, at in self._last_seen.items()
+                if at >= since and mac in self._registered_uid
+            }
 
     def known_boards(self) -> int:
         with self._lock:

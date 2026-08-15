@@ -188,7 +188,177 @@ def test_second_real_fall_passes_after_downgraded_one():
     sent.assert_awaited_once()
 
 
-# ── B. 에스컬레이션 태스크가 GC로 사라지면 안 된다 ──────────────────────────
+# ── B. 살아 있는 보드가 앱에 "신호 없음"으로 보이면 안 된다 ──────────────────
+#
+# 하트비트(I4)를 보낼 수 있는 건 CSI 라인을 받는 이 데몬뿐이다. 안 보내면 Spring의
+# last_seen_at이 영원히 null이고, 노드가 멀쩡히 도는데도 보호자 앱 디바이스 화면은
+# "신호 없음"으로 남는다 — 오류 하나 없이 화면만 거짓말하는 종류다.
+
+
+class FakeDeviceConfig:
+    """레지스트리 DeviceConfig 중 라우터가 실제로 읽는 필드만."""
+
+    def __init__(self, device_id: str, tx1_id=None, tx2_id=None, tx3_id=None):
+        self.device_id = device_id
+        self.tx1_id = tx1_id
+        self.tx2_id = tx2_id
+        self.tx3_id = tx3_id
+
+
+def feed(router, mac: str, at: float) -> None:
+    """CSI 한 줄이 들어온 것처럼 라우터를 돌린다(파싱 자체는 모델 영역이라 세워 둔다)."""
+    import numpy as np
+
+    with patch(
+        "app.stream.router.parse_csi_line",
+        return_value=(mac, np.zeros(256, dtype=np.float32)),
+    ):
+        router.handle("CSI_DATA,...", at)
+
+
+def make_router():
+    from app.stream.buffer import BufferSet
+    from app.stream.router import PacketRouter
+
+    return PacketRouter(BufferSet(links=3, retain_seconds=60))
+
+
+def stream_client():
+    """펌프가 실제로 부르는 spring_client 모듈 — 여기에 패치를 걸어야 한다."""
+    from app.stream import pump as pump_module
+
+    return pump_module.spring_client
+
+
+def test_alive_boards_uses_registered_uid_not_normalized_mac():
+    """Spring은 device_uid를 완전 일치로 찾는다.
+
+    라우터는 표기 흔들림을 흡수하려고 MAC을 소문자로 정규화하는데, 그 값을 그대로
+    하트비트에 쓰면 대문자로 등록된 기기는 매번 404다 — 그리고 404는 조용하다.
+    """
+    pytest.importorskip("notifi_ai")
+    router = make_router()
+    router.reload([FakeDeviceConfig("care-1", tx1_id="1A:00:00:00:00:00")])
+
+    feed(router, "1a:00:00:00:00:00", 100.0)
+
+    assert list(router.alive_boards(since=99.0)) == ["1A:00:00:00:00:00"]
+
+
+def test_alive_boards_excludes_silent_board():
+    """전원이 빠진 보드에까지 하트비트를 보내면 앱은 죽은 노드를 정상으로 표시한다."""
+    pytest.importorskip("notifi_ai")
+    router = make_router()
+    router.reload([FakeDeviceConfig("care-1", tx1_id="aa", tx2_id="bb")])
+
+    feed(router, "aa", 100.0)
+    feed(router, "bb", 200.0)
+
+    assert list(router.alive_boards(since=150.0)) == ["bb"]
+
+
+def test_unregistered_board_is_not_tracked():
+    pytest.importorskip("notifi_ai")
+    router = make_router()
+    router.reload([FakeDeviceConfig("care-1", tx1_id="aa")])
+
+    feed(router, "ff", 100.0)
+
+    assert router.alive_boards(since=0.0) == {}
+
+
+def test_removed_board_stops_being_reported():
+    """등록에서 빠진 보드가 계속 살아 있는 것으로 보고되면 안 된다."""
+    pytest.importorskip("notifi_ai")
+    router = make_router()
+    router.reload([FakeDeviceConfig("care-1", tx1_id="aa")])
+    feed(router, "aa", 100.0)
+
+    router.reload([FakeDeviceConfig("care-1", tx1_id="bb")])
+
+    assert router.alive_boards(since=0.0) == {}
+
+
+def make_pump_with_live_board(interval: float = 60.0):
+    pump = make_pump()
+    pump._config = pump._config.model_copy(
+        update={"notifi_stream_heartbeat_seconds": interval}
+    )
+    pump.router.reload([FakeDeviceConfig("care-1", tx1_id="aa")])
+    feed(pump.router, "aa", 100.0)
+    return pump
+
+
+def test_heartbeat_is_sent_once_per_interval():
+    """윈도 루프는 stride(2초)마다 도는데 하트비트까지 매번 보내면 Spring을 두드리기만 한다."""
+    pytest.importorskip("notifi_ai")
+    pump = make_pump_with_live_board()
+    sender = AsyncMock(return_value=True)
+
+    async def run():
+        with patch.object(stream_client(), "send_heartbeat", new=sender):
+            await pump._flush_heartbeats(100.0)
+            await pump._flush_heartbeats(102.0)  # stride만 지났다 — 아직 주기가 아니다
+            feed(pump.router, "aa", 161.0)
+            await pump._flush_heartbeats(161.0)
+
+    asyncio.run(run())
+    assert sender.await_count == 2
+    assert pump.stats["heartbeats"] == 2
+
+
+def test_heartbeat_failure_does_not_break_the_window_loop():
+    """하트비트는 부가 정보다. 여기서 예외가 새면 그 stride의 낙상 판정이 통째로 날아간다."""
+    pytest.importorskip("notifi_ai")
+    import httpx
+
+    pump = make_pump_with_live_board()
+
+    async def run():
+        with patch.object(
+            stream_client(),
+            "send_heartbeat",
+            new=AsyncMock(side_effect=httpx.ConnectError("spring down")),
+        ):
+            await pump._flush_heartbeats(100.0)
+
+    asyncio.run(run())  # 예외가 올라오면 실패한다
+    assert pump.stats["heartbeats"] == 0
+
+
+def test_unregistered_board_warns_once(caplog):
+    """Spring에 등록 안 된 보드는 주기마다 404다 — 같은 경고가 로그를 덮으면 안 된다."""
+    pytest.importorskip("notifi_ai")
+    pump = make_pump_with_live_board()
+
+    async def run():
+        with patch.object(stream_client(), "send_heartbeat", new=AsyncMock(return_value=False)):
+            await pump._flush_heartbeats(100.0)
+            feed(pump.router, "aa", 161.0)
+            await pump._flush_heartbeats(161.0)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(run())
+
+    warned = [r for r in caplog.records if "등록되지 않은 보드" in r.getMessage()]
+    assert len(warned) == 1
+    assert pump.stats["heartbeats"] == 0
+
+
+def test_heartbeat_can_be_disabled():
+    pytest.importorskip("notifi_ai")
+    pump = make_pump_with_live_board(interval=0.0)
+    sender = AsyncMock(return_value=True)
+
+    async def run():
+        with patch.object(stream_client(), "send_heartbeat", new=sender):
+            await pump._flush_heartbeats(100.0)
+
+    asyncio.run(run())
+    sender.assert_not_awaited()
+
+
+# ── C. 에스컬레이션 태스크가 GC로 사라지면 안 된다 ──────────────────────────
 
 def test_scheduled_agent_task_is_retained():
     """create_task 반환값을 버리면 루프가 약한 참조만 들고 있어 실행 중 사라질 수 있다.
@@ -214,7 +384,7 @@ def test_scheduled_agent_task_is_retained():
     assert finished == [True]
 
 
-# ── C. 반쪽 윈도는 캘리브레이션 트라이얼로 받지 않는다 ──────────────────────
+# ── D. 반쪽 윈도는 캘리브레이션 트라이얼로 받지 않는다 ──────────────────────
 
 def test_low_coverage_trial_is_rejected():
     pytest.importorskip("notifi_ai")

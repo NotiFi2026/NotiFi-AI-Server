@@ -20,6 +20,7 @@ import httpx
 from fastapi.concurrency import run_in_threadpool
 
 from app.agent.schemas import RiskLevel
+from app.clients import spring_client
 from app.common.logging_config import logger
 from app.config import Settings
 from app.model import ingest_service, pipeline
@@ -58,7 +59,18 @@ class StreamPump:
         self._started_at: float | None = None
         #: 진행 중인 에스컬레이션 에이전트 태스크. GC로 사라지지 않게 붙잡아 둔다
         self._agent_tasks: set[asyncio.Task] = set()
-        self.stats = {"lines": 0, "packets": 0, "windows": 0, "sent": 0, "skipped_cooldown": 0}
+        #: 보드별 마지막 하트비트 전송 시각 — 주기를 지키는 기준
+        self._last_heartbeat: dict[str, float] = {}
+        #: Spring에 등록되지 않아 404가 난 보드. 주기마다 같은 경고를 반복하지 않는다
+        self._unregistered_warned: set[str] = set()
+        self.stats = {
+            "lines": 0,
+            "packets": 0,
+            "windows": 0,
+            "sent": 0,
+            "skipped_cooldown": 0,
+            "heartbeats": 0,
+        }
 
     # ── 수명주기 ────────────────────────────────────────────────────────────
 
@@ -134,6 +146,7 @@ class StreamPump:
         while not self._stop.is_set():
             try:
                 await asyncio.sleep(stride)
+                await self._flush_heartbeats(time.monotonic())
                 for buffer in self.buffers.active():
                     await self._process(buffer.device_id)
             except asyncio.CancelledError:
@@ -143,6 +156,52 @@ class StreamPump:
                     "윈도 처리 실패",
                     extra={"action": "stream_window_failed", "error": str(exc)},
                     exc_info=True,
+                )
+
+    async def _flush_heartbeats(self, now: float) -> None:
+        """송신 중인 보드마다 Spring에 생존 신호를 보낸다(I4).
+
+        보드가 살아 있다는 걸 아는 건 CSI 라인을 받는 여기뿐이다. 이 호출이 없으면
+        Spring의 `last_seen_at`이 갱신되지 않아, 노드가 멀쩡히 도는 동안에도 보호자 앱
+        디바이스 화면은 "신호 없음"으로 남는다.
+
+        **판정 루프를 절대 방해하지 않는다.** 하트비트는 부가 정보이고 낙상 감지는 아니다 —
+        여기서 예외가 새면 그 stride의 윈도 처리가 통째로 날아간다. 그래서 실패를 안에서
+        삼키고, 실패한 보드도 주기만큼 쉬었다 재시도한다(Spring이 죽어 있으면 stride마다
+        재시도가 로그를 덮는다. 임계가 5분이라 한 주기 늦어도 상태는 뒤집히지 않는다).
+        """
+        interval = self._config.notifi_stream_heartbeat_seconds
+        if interval <= 0:
+            return
+
+        for device_uid in self.router.alive_boards(since=now - interval):
+            last = self._last_heartbeat.get(device_uid)
+            if last is not None and now - last < interval:
+                continue
+            self._last_heartbeat[device_uid] = now
+            try:
+                registered = await spring_client.send_heartbeat(device_uid)
+            except Exception as exc:  # noqa: BLE001 - 하트비트 실패가 감지를 막으면 안 된다
+                logger.warning(
+                    "하트비트 전송 실패",
+                    extra={
+                        "action": "stream_heartbeat_failed",
+                        "device_uid": device_uid,
+                        "error": str(exc),
+                    },
+                )
+                continue
+
+            if registered:
+                self.stats["heartbeats"] += 1
+                self._unregistered_warned.discard(device_uid)
+            elif device_uid not in self._unregistered_warned:
+                # 보드는 켰는데 앱에서 D1 등록을 안 했거나 MAC 표기가 어긋난 상태다.
+                # Spring은 device_uid를 완전 일치로 찾으므로 대소문자만 달라도 여기로 온다
+                self._unregistered_warned.add(device_uid)
+                logger.warning(
+                    "Spring에 등록되지 않은 보드 — 하트비트 무시됨",
+                    extra={"action": "stream_heartbeat_unregistered", "device_uid": device_uid},
                 )
 
     async def _process(self, device_id: str) -> None:

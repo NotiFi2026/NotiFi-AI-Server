@@ -1,4 +1,4 @@
-"""Spring 백엔드 내부 API 클라이언트 (I1·I2·I3·I5·I6)."""
+"""Spring 백엔드 내부 API 클라이언트 (I1·I2·I3·I4·I5·I6)."""
 from datetime import datetime
 from typing import Any, Optional
 
@@ -163,6 +163,31 @@ async def save_daily_report(
             "newly_created": resp.status_code == 201,
         },
     )
+
+
+async def send_heartbeat(device_uid: str) -> bool:
+    """I4: 노드 생존 신호. `tb_device.last_seen_at`을 갱신한다.
+
+    보드가 살아 있다는 사실을 아는 건 CSI 라인을 받는 우리뿐이다. 이걸 보내지 않으면
+    Spring의 `last_seen_at`이 영원히 null이고, 보호자 앱 디바이스 화면은 노드가 멀쩡히
+    송신 중인데도 "신호 없음"으로 표시한다.
+
+    **404를 예외로 올리지 않는다.** Spring은 등록되지 않은 device_uid에 404를 준다.
+    보드는 켰는데 앱에서 등록을 안 한 상태가 설치 현장에서 가장 흔한데, 그때마다
+    예외가 올라오면 주기마다 스택트레이스가 쌓인다. 호출부가 MAC당 한 번만 경고하도록
+    성공 여부만 돌려준다.
+    """
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{_BASE}/devices/{device_uid}/heartbeat",
+            headers=_HEADERS,
+            timeout=5.0,
+        )
+    if resp.status_code == 404:
+        return False
+    resp.raise_for_status()
+    # 성공은 로그를 남기지 않는다 — 보드 수 × 주기만큼 데몬 로그가 하트비트로 덮인다
+    return True
 
 
 async def send_pose_clip(

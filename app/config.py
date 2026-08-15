@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     # 위험 판정 재신고 억제. Spring은 DANGER마다 에스컬레이션을 새로 만들므로,
     # 이게 없으면 한 번 넘어졌는데 겹치는 윈도 수만큼 119 신고가 걸린다
     notifi_stream_cooldown_seconds: float = 120.0
+    # 살아 있는 보드마다 Spring I4를 치는 주기. Spring의 무신호 임계(5분)보다 넉넉히 짧아야
+    # 정상 노드가 끊긴 것으로 보이지 않는다. 0 이하면 하트비트를 보내지 않는다
+    notifi_stream_heartbeat_seconds: float = 60.0
     notifi_stream_replay_path: str = ""
     notifi_stream_replay_speed: float = 1.0
     notifi_stream_replay_loop: bool = False
